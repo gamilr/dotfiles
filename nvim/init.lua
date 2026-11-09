@@ -903,11 +903,12 @@ require('lazy').setup({
         },
       }
 
-      -- nixd: not in Mason (no upstream prebuilts). Installed by dotfiles/setup
-      -- through the Nix profile. Gives proper hover
-      -- with nixpkgs docs / module options — nil's hover is intentionally empty.
-      local nixd_path = vim.fn.expand '~/.nix-profile/bin/nixd'
-      if vim.fn.executable(nixd_path) == 1 then
+      -- nixd: not in Mason (no upstream prebuilts) and not installed by
+      -- dotfiles/setup; used when it is on PATH (a Nix profile or dev shell).
+      -- Gives proper hover with nixpkgs docs / module options — nil's hover is
+      -- intentionally empty.
+      local nixd_path = vim.fn.exepath 'nixd'
+      if nixd_path ~= '' then
         vim.lsp.config('nixd', {
           cmd = { nixd_path },
           filetypes = { 'nix' },

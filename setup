@@ -7,8 +7,10 @@ set -euo pipefail
 # Safe on a machine you do not fully own, such as a work laptop. By default it
 # only creates symlinks: it never touches git config, never moves or replaces
 # anything already in ~/.claude, and leaves shell rc files alone.
-# Installing packages, Nix, fonts and agent CLIs (claude, opencode), and wiring
+# Installing packages, fonts and agent CLIs (claude, opencode), and wiring
 # PATH, atuin, direnv and herdr into shell rc files, happen only with --install.
+# Everything installs straight onto the machine with its own package manager:
+# Homebrew on macOS, pacman on Arch, apt on Debian/Ubuntu. No Nix.
 #
 # Usage:
 #   ./setup                # link configs only
@@ -95,7 +97,8 @@ hdr()  { echo -e "\n${BOLD}━━ $* ━━${NC}"; }
 #
 # Neovim kickstart requires:
 #   Bootstrap: git make unzip gcc/clang curl tar python3
-#   Nix      : neovim tmux rg fd fzf jq lazygit direnv atuin nixd node/yarn/bun
+#   Packages : neovim tmux rg fd fzf jq lazygit direnv atuin tree-sitter
+#              node/npm, yarn (markdown-preview build), bun (opencode plugins)
 #   Python   : python3 + pynvim (jupytext, molten, mason python LSPs)
 #   Linux    : xclip / wl-clipboard (clipboard fallback if OSC52 unavailable)
 #
@@ -114,7 +117,7 @@ hdr()  { echo -e "\n${BOLD}━━ $* ━━${NC}"; }
 has() { command -v "$1" &>/dev/null; }
 
 # ── Preflight: can we get root? ──────────────────────────────────
-# Package installs and the Nix installer need root. When there is no TTY —
+# Linux package installs need root. When there is no TTY —
 # running from an editor task, a CI step, or an agent shell — sudo cannot
 # prompt, and those steps fail one by one inside silenced subcommands.
 # Detect it once and say so plainly instead.
@@ -128,13 +131,18 @@ check_sudo() {
     return 0
   fi
   warn "No TTY available and sudo needs a password."
-  warn "Skipping Nix and distro packages. Re-run from a real terminal to finish."
+  warn "Skipping distro packages. Re-run from a real terminal to finish."
   return 1
 }
 
-# Bootstrap packages: generic_name|binary|macos_pkg|debian_pkg|arch_pkg
-# Binary column avoids a separate bin_for() lookup function.
-# Empty pkg column → skip that distro for that package.
+# Packages installed with the machine's own package manager.
+# Format: generic_name|binaries|macos_brew|debian_apt|arch_pacman
+#   binaries: comma-separated; any one present counts (Debian renames fd to
+#   fdfind and yarn to yarnpkg).
+#   Empty package column: that distro has no package; setup says so instead.
+# Names checked against formulae.brew.sh, archlinux.org and Debian's archive.
+# Debian 12 lacks lazygit, atuin and tree-sitter-cli (Debian 13 has them), and
+# Debian 13's neovim is 0.10, older than the 0.11 kickstart needs.
 PACKAGES=(
   "git|git|git|git|git"
   "make|make|make|make|make"
@@ -142,39 +150,32 @@ PACKAGES=(
   "curl|curl|curl|curl|curl"
   "gcc|gcc|gcc|gcc|gcc"
   "python3|python3|python3|python3|python"
+  "neovim|nvim|neovim|neovim|neovim"
+  "tmux|tmux|tmux|tmux|tmux"
+  "ripgrep|rg|ripgrep|ripgrep|ripgrep"
+  "fd|fd,fdfind|fd|fd-find|fd"
+  "fzf|fzf|fzf|fzf|fzf"
+  "jq|jq|jq|jq|jq"
+  "lazygit|lazygit|lazygit|lazygit|lazygit"
+  "direnv|direnv|direnv|direnv|direnv"
+  "atuin|atuin|atuin|atuin|atuin"
+  "tree-sitter CLI|tree-sitter|tree-sitter-cli|tree-sitter-cli|tree-sitter-cli"
+  "node.js|node|node|nodejs|nodejs"
+  "npm|npm|node|npm|npm"
+  "yarn|yarn,yarnpkg|yarn|yarnpkg|yarn"
+  "bun|bun|bun||bun"
 )
 
-# Fonts — installed via the native package manager per OS, because each font
-# system has different validation rules:
-#   • macOS Core Text rejects fonts with the +x bit or unusual table layouts;
-#     brew casks are pre-validated and register reliably with Font Book.
-#   • Linux fontconfig follows symlinks fine, so nix profile works there.
-# 0xProto = clean, designed-for-coding sans monospace with strong character
-# disambiguation (0/O, 1/l/I); Nerd Font variant ships icon glyphs.
-# Format: display_name|macos_brew_cask|linux_nixpkgs_attr
+# Fonts, from the native package manager. macOS Core Text rejects fonts with
+# the +x bit or unusual table layouts; brew casks are pre-validated and
+# register reliably with Font Book.
+# 0xProto = clean, designed-for-coding monospace with strong character
+# disambiguation (0/O, 1/l/I); JetBrainsMono covers the icon ranges the
+# ghostty config maps to it. Nerd Font variants ship the icon glyphs.
+# Format: display_name (as fc-list reports it)|macos_brew_cask|arch_pkg
 FONTS=(
-  "0xProto Nerd Font|font-0xproto-nerd-font|nerd-fonts._0xproto"
-)
-
-# Portable user tools installed through `nix profile` on macOS/Linux.
-# Format: generic_name|binary|nixpkgs_attr
-NIX_PROFILE_PACKAGES=(
-  "neovim|nvim|neovim"
-  "tmux|tmux|tmux"
-  "ripgrep|rg|ripgrep"
-  "fd|fd|fd"
-  "fzf|fzf|fzf"
-  "jq|jq|jq"
-  "lazygit|lazygit|lazygit"
-  "direnv|direnv|direnv"
-  "atuin|atuin|atuin"
-  "nixd|nixd|nixd"
-  "nixfmt|nixfmt|nixfmt"
-  "tree-sitter CLI|tree-sitter|tree-sitter"
-  "node.js|node|nodejs"
-  "npm|npm|nodejs"
-  "yarn|yarn|yarn"
-  "bun|bun|bun"
+  "0xProto Nerd Font|font-0xproto-nerd-font|ttf-0xproto-nerd"
+  "JetBrainsMono Nerd Font|font-jetbrains-mono-nerd-font|ttf-jetbrains-mono-nerd"
 )
 
 # Agent CLIs — single registry for install and check.
@@ -193,12 +194,65 @@ distro_col() {
   esac
 }
 
-pkg_install_cmd() {
-  case "$1" in
-    macos)  echo "brew install" ;;
-    debian) echo "sudo apt-get install -y" ;;
-    arch)   echo "sudo pacman -S --noconfirm" ;;
+# has_any "a,b": true when any of the comma-separated binaries is on PATH.
+has_any() {
+  local b IFS=,
+  for b in $1; do has "$b" && return 0; done
+  return 1
+}
+
+install_pkg() {
+  case "$DISTRO" in
+    macos)  brew install "$1" ;;
+    debian) sudo apt-get install -y "$1" ;;
+    arch)   sudo pacman -S --noconfirm --needed "$1" ;;
   esac
+}
+
+# Homebrew lives outside the default PATH on Apple Silicon (/opt/homebrew) and
+# right after its own installer runs. Pick it up for the rest of this run.
+ensure_brew_path() {
+  has brew && return 0
+  local b
+  for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+    if [[ -x "$b" ]]; then
+      eval "$("$b" shellenv)"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# Only when this script installed Homebrew: its installer prints the PATH
+# step instead of doing it, and future shells need it.
+BREW_BLOCK_MARK="# >>> homebrew shellenv (managed by dotfiles/setup) >>>"
+BREW_BLOCK_END="# <<< homebrew shellenv <<<"
+wire_brew_shellenv() {
+  local rc="$1"
+  [[ -f "$rc" ]] || : > "$rc"
+  if grep -Fq "$BREW_BLOCK_MARK" "$rc" || grep -q 'brew shellenv' "$rc"; then
+    ok "Homebrew already on PATH via $(basename "$rc")"
+    return
+  fi
+  cat >> "$rc" <<EOF
+
+$BREW_BLOCK_MARK
+if [ -x /opt/homebrew/bin/brew ]; then eval "\$(/opt/homebrew/bin/brew shellenv)"
+elif [ -x /usr/local/bin/brew ]; then eval "\$(/usr/local/bin/brew shellenv)"
+fi
+$BREW_BLOCK_END
+EOF
+  ok "Homebrew shellenv added to $rc"
+}
+
+# Debian ships yarn as `yarnpkg`; markdown-preview.nvim's build runs `yarn`.
+link_debian_aliases() {
+  [[ "$DISTRO" == "debian" ]] || return 0
+  if ! has yarn && has yarnpkg; then
+    mkdir -p "$HOME/.local/bin"
+    ln -sf "$(command -v yarnpkg)" "$HOME/.local/bin/yarn"
+    ok "yarn -> yarnpkg (~/.local/bin)"
+  fi
 }
 
 # ── Shared: nvim version check ───────────────────────────────────
@@ -297,39 +351,6 @@ EOF
   ok "atuin init added to $rc"
 }
 
-# ── Nix: Determinate Nix installer (cross-platform, official) ────
-# Idempotent: if `nix` is already on PATH (any flavor — Determinate, official,
-# nix-darwin, NixOS), we leave it alone. The user can upgrade with
-# `determinate-nixd upgrade` (Determinate) or `nix upgrade-nix`.
-install_nix() {
-  if has nix; then
-    ok "nix ($(nix --version 2>/dev/null | awk '{print $NF}'))"
-    return
-  fi
-  if [[ "$SUDO_OK" != true ]]; then
-    warn "nix install needs root — skipped"
-    return
-  fi
-  log "Installing Determinate Nix..."
-  if curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix \
-      | sh -s -- install --determinate --no-confirm; then
-    # Source the daemon profile so the rest of this script sees `nix` immediately.
-    [[ -f /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ]] && \
-      . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
-    ok "nix installed — restart your shell to pick up the daemon env globally"
-  else
-    warn "nix install failed — see https://install.determinate.systems"
-  fi
-}
-
-# ── Nix profile: portable user tools ──────────────────────────────
-ensure_nix_profile_path() {
-  local profile_bin="$HOME/.nix-profile/bin"
-  if [[ -d "$profile_bin" && ":$PATH:" != *":$profile_bin:"* ]]; then
-    export PATH="$profile_bin:$PATH"
-  fi
-}
-
 # ~/.local/bin is where the herdr, claude and opencode installers land their
 # binaries. None of them wire it into PATH, so do it here for the rest of this
 # run; wire_local_bin_path_shell() makes it stick for future shells.
@@ -340,119 +361,47 @@ ensure_local_bin_path() {
   fi
 }
 
-nix_profile_has_attr() {
-  local profile
-  profile="$(nix profile list 2>/dev/null || true)"
-  grep -Eq "Flake attribute:.*\.$1$" <<< "$profile"
-}
-
-install_nix_profile_tools() {
-  has nix || { warn "nix not available — skipping Nix profile tools"; return; }
-  ensure_nix_profile_path
-  log "Installing portable tools via Nix profile..."
-
-  for entry in "${NIX_PROFILE_PACKAGES[@]}"; do
-    IFS='|' read -ra f <<< "$entry"
-    local name="${f[0]}" bin="${f[1]}" attr="${f[2]}"
-
-    if nix_profile_has_attr "$attr"; then
-      if has "$bin"; then ok "$name (nix profile)"; else warn "$name installed, but $bin is not on PATH"; fi
-      continue
-    fi
-
-    log "Installing $name (nixpkgs#$attr)..."
-    if nix profile add "nixpkgs#$attr"; then
-      ensure_nix_profile_path
-      if has "$bin"; then ok "$name installed"; else warn "$name installed, but $bin is not on PATH yet"; fi
-    else
-      warn "$name install failed — try manually: nix profile add nixpkgs#$attr"
-    fi
-  done
-}
-
-# Nix drops fonts in ~/.nix-profile/share/fonts, which fontconfig does not
-# scan by default — so `nix profile list` shows the font installed while
-# `fc-list` finds nothing and apps fall back silently. Link it into
-# ~/.local/share/fonts, which fontconfig does scan, then refresh the cache.
-register_nix_fonts_linux() {
-  [[ "$OS" == "linux" ]] || return 0
-  local src="$HOME/.nix-profile/share/fonts/truetype/NerdFonts"
-  local dst="$HOME/.local/share/fonts/nix-nerdfonts"
-  [[ -d "$src" ]] || return 0
-  mkdir -p "$HOME/.local/share/fonts"
-  if [[ "$(readlink "$dst" 2>/dev/null)" != "$src" ]]; then
-    ln -sfn "$src" "$dst"
-    ok "nix fonts linked into ~/.local/share/fonts"
+font_installed() {
+  local name="$1" cask="$2"
+  if [[ "$OS" == "macos" ]]; then
+    has brew && brew list --cask "$cask" &>/dev/null
+  else
+    # fontconfig is the source of truth on Linux. Capture first: piping
+    # fc-list into `grep -q` kills it with SIGPIPE, which pipefail reports.
+    local fonts=""
+    if has fc-list; then fonts="$(fc-list 2>/dev/null || true)"; fi
+    [[ -n "$fonts" ]] && grep -qiF "$name" <<< "$fonts"
   fi
-  has fc-cache && fc-cache -f &>/dev/null || true
 }
 
 install_fonts() {
   log "Installing fonts..."
   for entry in "${FONTS[@]}"; do
     IFS='|' read -ra f <<< "$entry"
-    local name="${f[0]}" cask="${f[1]}" attr="${f[2]}"
-
-    case "$OS" in
+    local name="${f[0]}" cask="${f[1]}" archpkg="${f[2]:-}"
+    if font_installed "$name" "$cask"; then
+      ok "$name"
+      continue
+    fi
+    case "$DISTRO" in
       macos)
-        if brew list --cask "$cask" &>/dev/null; then
-          ok "$name (brew cask)"
-        else
-          log "Installing $name via brew cask..."
-          brew install --cask "$cask" &>/dev/null \
-            && ok "$name installed" \
-            || warn "$name install failed — try manually: brew install --cask $cask"
-        fi
+        if ! has brew; then warn "$name: no Homebrew — skipped"; continue; fi
+        brew install --cask "$cask" &>/dev/null \
+          && ok "$name installed" \
+          || warn "$name install failed — try manually: brew install --cask $cask"
         ;;
-      linux)
-        has nix || { warn "$name: nix not available, skipping"; continue; }
-        if nix_profile_has_attr "$attr"; then
-          ok "$name (nix profile)"
-        else
-          log "Installing $name (nixpkgs#$attr)..."
-          if nix profile add "nixpkgs#$attr"; then
-            ok "$name installed"
-          else
-            warn "$name install failed — try manually: nix profile add nixpkgs#$attr"
-          fi
-        fi
+      arch)
+        if [[ "$SUDO_OK" != true ]]; then warn "$name install needs root — skipped"; continue; fi
+        sudo pacman -S --noconfirm --needed "$archpkg" &>/dev/null \
+          && ok "$name installed" \
+          || warn "$name install failed — try manually: sudo pacman -S $archpkg"
+        ;;
+      *)
+        warn "$name: no package here — get it from https://www.nerdfonts.com/font-downloads into ~/.local/share/fonts"
         ;;
     esac
   done
-
-  register_nix_fonts_linux
-}
-
-NIX_PROFILE_PATH_BLOCK_MARK="# >>> nix profile path (managed by dotfiles/setup) >>>"
-NIX_PROFILE_PATH_BLOCK_END="# <<< nix profile path <<<"
-wire_nix_profile_path_shell() {
-  local rc="$1"
-  if [[ ! -f "$rc" ]]; then
-    log "Creating $rc for Nix profile PATH..."
-    : > "$rc"
-  fi
-  if grep -Fq "$NIX_PROFILE_PATH_BLOCK_MARK" "$rc"; then
-    ok "nix profile PATH already wired into $rc"
-    return
-  fi
-
-  log "Adding nix profile PATH to $rc..."
-  local tmp
-  tmp="$(mktemp)"
-  {
-    echo "$NIX_PROFILE_PATH_BLOCK_MARK"
-    echo 'if [ -d "$HOME/.nix-profile/bin" ]; then'
-    echo '  case ":$PATH:" in'
-    echo '    *":$HOME/.nix-profile/bin:"*) ;;'
-    echo '    *) export PATH="$HOME/.nix-profile/bin:$PATH" ;;'
-    echo '  esac'
-    echo 'fi'
-    echo "$NIX_PROFILE_PATH_BLOCK_END"
-    echo ""
-    cat "$rc"
-  } > "$tmp"
-  mv "$tmp" "$rc"
-  ok "nix profile PATH added to $rc"
+  if [[ "$OS" == "linux" ]] && has fc-cache; then fc-cache -f &>/dev/null || true; fi
 }
 
 LOCAL_BIN_PATH_BLOCK_MARK="# >>> local bin path (managed by dotfiles/setup) >>>"
@@ -851,7 +800,7 @@ recommend_optional() {
   hdr "Recommended (manual)"
   echo "  Ghostty terminal:"
   case "$DISTRO" in
-    macos)  echo "    brew install --cask ghostty  (native app; keep outside Nix profile)" ;;
+    macos)  echo "    brew install --cask ghostty" ;;
     arch)   echo "    sudo pacman -S ghostty  (Omarchy: pre-installed)" ;;
     debian) echo "    No official .deb yet — see https://ghostty.org/docs" ;;
   esac
@@ -881,37 +830,42 @@ install_deps() {
     return 0
   fi
 
-  # On macOS, ensure Homebrew exists
-  if [[ "$DISTRO" == "macos" ]] && ! has brew; then
-    log "Installing Homebrew..."
-    if ! /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; then
-      warn "Homebrew install failed (it needs an admin account); brew steps will fail"
+  # On macOS, ensure Homebrew exists. Judge by the result, not the exit code:
+  # behind a proxy curl fails, `bash -c ""` then succeeds, and nothing is there.
+  if [[ "$DISTRO" == "macos" ]]; then
+    ensure_brew_path
+    if ! has brew; then
+      log "Installing Homebrew (needs an admin account)..."
+      /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" || true
+      ensure_brew_path
+      if has brew; then
+        wire_brew_shellenv "$HOME/.zprofile"
+      else
+        warn "Homebrew not installed (needs admin rights and network access)"
+      fi
     fi
   fi
 
   # On Debian, update package index once
-  if [[ "$DISTRO" == "debian" ]]; then
+  if [[ "$DISTRO" == "debian" && "$SUDO_OK" == true ]]; then
     log "Updating apt index..."
-    sudo apt-get update -qq
+    sudo apt-get update -qq || warn "apt-get update failed"
   fi
 
   local col
   col="$(distro_col "$DISTRO")"
-  local install_cmd
-  install_cmd="$(pkg_install_cmd "$DISTRO")"
-  local to_install=()
+  local to_install=() manual=()
 
   for entry in "${PACKAGES[@]}"; do
     IFS='|' read -ra f <<< "$entry"
-    local name="${f[0]}" bin="${f[1]}" pkg="${f[$col]}"
-
-    [[ -z "$pkg" ]] && continue
-
-    if has "$bin"; then
-      ok "$name ($bin found)"
+    local name="${f[0]}" bins="${f[1]}" pkg="${f[$col]:-}"
+    if has_any "$bins"; then
+      ok "$name"
+    elif [[ -z "$pkg" ]]; then
+      manual+=("$name")
     else
-      to_install+=("$pkg")
       warn "$name not found — will install $pkg"
+      [[ " ${to_install[*]:-} " == *" $pkg "* ]] || to_install+=("$pkg")
     fi
   done
 
@@ -919,44 +873,43 @@ install_deps() {
   if [[ "$OS" == "linux" ]]; then
     if has xclip || has xsel || has wl-copy; then
       ok "clipboard tool found"
+    elif [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+      warn "No clipboard tool — will install wl-clipboard"
+      to_install+=("wl-clipboard")
     else
-      if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
-        case "$DISTRO" in
-          arch)   to_install+=("wl-clipboard") ;;
-          debian) to_install+=("wl-clipboard") ;;
-        esac
-        warn "No clipboard tool — will install wl-clipboard"
-      else
-        to_install+=("xclip")
-        warn "No clipboard tool — will install xclip"
-      fi
+      warn "No clipboard tool — will install xclip"
+      to_install+=("xclip")
     fi
   fi
 
   if [[ ${#to_install[@]} -eq 0 ]]; then
-    log "All dependencies already installed."
-  elif [[ "$SUDO_OK" != true ]]; then
+    log "All packages already installed."
+  elif [[ "$OS" == "linux" && "$SUDO_OK" != true ]]; then
     warn "Cannot install without root: ${to_install[*]}"
+  elif [[ "$OS" == "macos" ]] && ! has brew; then
+    warn "No Homebrew — install by hand: ${to_install[*]}"
   else
     echo ""
-    log "Installing: ${to_install[*]}"
-    # Don't let one failed package abort the whole run under `set -e`.
-    if $install_cmd "${to_install[@]}"; then
-      ok "Package installation complete"
-    else
-      warn "Package installation failed — install manually: ${to_install[*]}"
+    local pkg failed=()
+    for pkg in "${to_install[@]}"; do
+      # One at a time: a package this release lacks must not take the rest of
+      # the batch down with it.
+      log "Installing $pkg..."
+      if install_pkg "$pkg"; then ok "$pkg"; else warn "$pkg install failed"; failed+=("$pkg"); fi
+    done
+    if [[ ${#failed[@]} -gt 0 ]]; then
+      warn "Install by hand: ${failed[*]}"
     fi
   fi
+  if [[ ${#manual[@]} -gt 0 ]]; then
+    warn "No $DISTRO package for: ${manual[*]} — see each project's install docs"
+  fi
 
+  link_debian_aliases
   install_pynvim
   install_playerctl_linux
   install_herdr
-  install_nix
-  install_nix_profile_tools
   install_fonts
-  wire_nix_profile_path_shell "$HOME/.zshrc"
-  wire_nix_profile_path_shell "$HOME/.bashrc"
-  wire_nix_profile_path_shell "$HOME/.profile"
   wire_local_bin_path_shell "$HOME/.zshrc"
   wire_local_bin_path_shell "$HOME/.bashrc"
   wire_local_bin_path_shell "$HOME/.profile"
@@ -1218,48 +1171,18 @@ post_link() {
 # ── Check deps (derives from package registries, no hardcoded list) ─
 check_deps() {
   hdr "Dependencies"
-  ensure_nix_profile_path
+  if [[ "$OS" == "macos" ]]; then
+    ensure_brew_path
+    if has brew; then ok "Homebrew"; else err "Homebrew not installed"; fi
+  fi
   for entry in "${PACKAGES[@]}"; do
     IFS='|' read -ra f <<< "$entry"
-    local bin="${f[1]}"
-    if has "$bin"; then ok "$bin"; else err "$bin not found"; fi
-  done
-  if has nix; then ok "nix $(nix --version 2>/dev/null | awk '{print $NF}')"; else err "nix not installed"; fi
-  for entry in "${NIX_PROFILE_PACKAGES[@]}"; do
-    IFS='|' read -ra f <<< "$entry"
-    local name="${f[0]}" bin="${f[1]}" attr="${f[2]}"
-    if has "$bin"; then ok "$name ($bin)"; else err "$name not found (nixpkgs#$attr)"; fi
+    local name="${f[0]}" bins="${f[1]}"
+    if has_any "$bins"; then ok "$name"; else err "$name not found"; fi
   done
   for entry in "${FONTS[@]}"; do
     IFS='|' read -ra f <<< "$entry"
-    local name="${f[0]}" cask="${f[1]}" attr="${f[2]}"
-    case "$OS" in
-      macos)
-        if brew list --cask "$cask" &>/dev/null; then ok "$name (brew cask)"; else err "$name not installed (brew install --cask $cask)"; fi
-        ;;
-      linux)
-        # fontconfig is the source of truth: a font present in the nix profile
-        # but absent from fc-list is invisible to every app that asks for it.
-        # Capture first — piping into `grep -q` makes fc-list die of SIGPIPE,
-        # which `set -o pipefail` would report as a failed check.
-        local installed_fonts=""
-        if has fc-list; then installed_fonts="$(fc-list 2>/dev/null || true)"; fi
-        if [[ -n "$installed_fonts" ]] && grep -qiF "$name" <<< "$installed_fonts"; then
-          ok "$name (fontconfig)"
-        elif nix_profile_has_attr "$attr"; then
-          err "$name in nix profile but not visible to fontconfig — rerun setup, or: fc-cache -f"
-        else
-          err "$name not in nix profile (nixpkgs#$attr)"
-        fi
-        ;;
-    esac
-  done
-  for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile"; do
-    if [[ -f "$rc" ]] && grep -Fq "$NIX_PROFILE_PATH_BLOCK_MARK" "$rc"; then
-      ok "nix profile PATH wired into $(basename "$rc")"
-    else
-      err "nix profile PATH not wired into $(basename "$rc")"
-    fi
+    if font_installed "${f[0]}" "${f[1]}"; then ok "${f[0]}"; else err "${f[0]} not installed"; fi
   done
   for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile"; do
     if [[ -f "$rc" ]] && grep -Fq "$LOCAL_BIN_PATH_BLOCK_MARK" "$rc"; then
@@ -1325,7 +1248,7 @@ main() {
         echo ""
         echo "Options:"
         echo "  (none)       Create symlinks only; installs nothing, edits no shell rc"
-        echo "  --install    Also install deps, Nix, fonts and agent CLIs, and wire PATH,"
+        echo "  --install    Also install deps, fonts and agent CLIs with brew/pacman/apt, and wire PATH,"
         echo "               atuin, direnv and herdr into ~/.zshrc ~/.bashrc ~/.profile ~/.zshenv"
         echo "  --check      Verify everything without making changes"
         echo "  --help, -h   Show this help"

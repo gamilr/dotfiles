@@ -5,8 +5,8 @@ set -euo pipefail
 # symlinks them to the correct system paths on macOS or Linux.
 #
 # Safe on a machine you do not fully own, such as a work laptop. By default it
-# only creates symlinks: it never touches git config, never replaces an
-# existing ~/.claude/settings.json, and leaves shell rc files alone.
+# only creates symlinks: it never touches git config, never moves or replaces
+# anything already in ~/.claude, and leaves shell rc files alone.
 # Installing packages, Nix, fonts and agent CLIs (claude, opencode), and wiring
 # PATH, atuin, direnv and herdr into shell rc files, happen only with --install.
 #
@@ -63,9 +63,9 @@ get_dest() {
 get_selective_items() {
   case "$1" in
     # hooks/ and skills/ back the SessionStart hooks in settings.json (herdr).
-    # settings.json is not in this list: link_claude_settings() links it only
-    # when the machine has none, so an existing (possibly managed) one survives.
-    claude)   echo "agents agent-memory statusline.sh hooks skills" ;;
+    # Linked by link_claude_child(), which merges instead of replacing.
+    # agent-memory is per machine and stays out of this repo.
+    claude)   echo "settings.json statusline.sh agents hooks skills" ;;
     opencode) echo "opencode.json oh-my-opencode.json package.json" ;;
     # The rest of ~/.config/herdr is per-machine runtime state: sockets,
     # logs, session.json, release-notes.json, config.toml backups.
@@ -667,7 +667,10 @@ normalize_claude_hook_paths() {
   local settings="$DOTFILES/claude/settings.json"
   [[ -f "$settings" ]] || return 0
   has python3 || { warn "python3 missing — skipped settings.json path normalization"; return 0; }
-  HOOK_SETTINGS="$settings" python3 - <<'PY'
+  # `|| rc=$?`: under set -e a failing python3 (the macOS stub when the
+  # Command Line Tools are missing) would otherwise end the whole run here.
+  local rc=0
+  HOOK_SETTINGS="$settings" python3 - <<'PY' || rc=$?
 import json, os, re, sys
 
 path = os.environ["HOOK_SETTINGS"]
@@ -727,7 +730,6 @@ if changed:
     open(path, "w").write(json.dumps(data, indent=2) + "\n")
     print("rewritten")
 PY
-  local rc=$?
   if [[ $rc -eq 0 ]]; then
     ok "claude hooks are \$HOME-relative and free of duplicates"
   else
@@ -735,32 +737,83 @@ PY
   fi
 }
 
-# ── Claude: settings.json without clobbering ────────────────────
-# A work machine may already have ~/.claude/settings.json carrying the
-# employer's setup: Bedrock or Vertex routing, an apiKeyHelper, proxy env,
-# policy. Replacing it with this repo's copy would break that, so link only
-# when nothing is there, and otherwise print how to merge by hand.
-link_claude_settings() {
-  local mode="$1"
-  local src="$DOTFILES/claude/settings.json"
-  local dst="$HOME/.claude/settings.json"
-  [[ -f "$src" ]] || return 0
+# ── Claude: add to ~/.claude, never replace what is there ───────
+# A work machine's ~/.claude may already carry the employer's setup:
+# settings.json with Bedrock or Vertex routing, an apiKeyHelper or policy;
+# hooks that settings.json calls; skills and agents the company hands out.
+# So nothing that exists is moved or replaced. Folders are merged entry by
+# entry (each agent, skill and hook from this repo is linked in beside the
+# machine's own) and a file is linked only when the machine has none. Real
+# folders also keep Claude Code's own writes in ~/.claude, not in this repo.
+link_claude_child() {
+  local src="$1" dst="$2" mode="$3"
+  [[ -e "$src" ]] || return 0
+  if [[ -d "$src" ]]; then
+    link_claude_dir "$src" "$dst" "$mode"
+  else
+    link_claude_file "$src" "$dst" "$mode"
+  fi
+}
+
+link_claude_file() {
+  local src="$1" dst="$2" mode="$3"
+  local name="${src##*/}"
   if [[ -L "$dst" && "$(readlink "$dst")" == "$src" ]]; then
-    ok "  settings.json"
+    ok "  $name"
   elif [[ -L "$dst" ]]; then
-    warn "  settings.json -> $(readlink "$dst") (not this repo's copy; left alone)"
-    warn "    Remove that link and rerun to use this repo's settings."
+    warn "  $name -> $(readlink "$dst") (not this repo's; left alone)"
   elif [[ -e "$dst" ]]; then
-    warn "  settings.json: kept the existing $dst (not replaced)"
-    warn "    To layer this repo's settings over it, merge by hand and review:"
-    warn "    jq -s '.[0] * .[1]' \"$dst\" \"$src\""
+    warn "  $name: kept the machine's own $dst"
+    if [[ "$name" == "settings.json" ]]; then
+      warn "    To layer this repo's settings over it, merge by hand and review:"
+      warn "    jq -s '.[0] * .[1]' \"$dst\" \"$src\""
+    fi
   elif [[ "$mode" == "check" ]]; then
-    err "  settings.json (missing)"
+    err "  $name (missing)"
   else
     mkdir -p "${dst%/*}"
     ln -s "$src" "$dst"
     ok "$dst -> $src"
   fi
+}
+
+link_claude_dir() {
+  local src="$1" dst="$2" mode="$3"
+  local name="${src##*/}"
+  if [[ -L "$dst" ]]; then
+    if [[ "$(readlink "$dst")" != "$src" ]]; then
+      warn "  $name -> $(readlink "$dst") (not this repo's; left alone)"
+      return 0
+    fi
+    # A whole-folder link from an earlier version of this script. Swap it for
+    # a real folder so the machine's own files have somewhere to live.
+    if [[ "$mode" == "check" ]]; then
+      warn "  $name links the whole repo folder (old layout; ./setup converts it)"
+      return 0
+    fi
+    rm "$dst"
+    log "  $name: whole-folder link replaced by per-entry links"
+  elif [[ -e "$dst" && ! -d "$dst" ]]; then
+    warn "  $name exists and is not a folder; left alone"
+    return 0
+  fi
+  [[ "$mode" == "check" ]] || mkdir -p "$dst"
+  local entry ename target
+  for entry in "$src"/*; do
+    [[ -e "$entry" ]] || continue
+    ename="${entry##*/}"
+    target="$dst/$ename"
+    if [[ -L "$target" && "$(readlink "$target")" == "$entry" ]]; then
+      ok "  $name/$ename"
+    elif [[ -e "$target" || -L "$target" ]]; then
+      warn "  $name/$ename: the machine has its own; kept it"
+    elif [[ "$mode" == "check" ]]; then
+      err "  $name/$ename (missing)"
+    else
+      ln -s "$entry" "$target"
+      ok "  $name/$ename -> $entry"
+    fi
+  done
 }
 
 # ── Git: keep machine-specific Claude keys out of commits ────────
@@ -831,7 +884,9 @@ install_deps() {
   # On macOS, ensure Homebrew exists
   if [[ "$DISTRO" == "macos" ]] && ! has brew; then
     log "Installing Homebrew..."
-    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    if ! /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; then
+      warn "Homebrew install failed (it needs an admin account); brew steps will fail"
+    fi
   fi
 
   # On Debian, update package index once
@@ -1042,11 +1097,12 @@ process_item() {
     dst_base="$(get_dest "$item")"
     log "$item (selective -> $dst_base)"
     for child in $selective_items; do
-      apply_link "$src/$child" "$dst_base/$child" "  $child" "$mode"
+      if [[ "$item" == "claude" ]]; then
+        link_claude_child "$src/$child" "$dst_base/$child" "$mode"
+      else
+        apply_link "$src/$child" "$dst_base/$child" "  $child" "$mode"
+      fi
     done
-    if [[ "$item" == "claude" ]]; then
-      link_claude_settings "$mode"
-    fi
   else
     local dst
     dst="$(get_dest "$item")"

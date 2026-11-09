@@ -927,15 +927,28 @@ install_deps() {
 install_agents() {
   hdr "Agent CLIs"
   for entry in "${AGENT_CLIS[@]}"; do
-    IFS='|' read -ra f <<< "$entry"
-    local name="${f[0]}" bin="${f[1]}" cmd="${f[2]}"
+    # Three names, not `read -a`: the last one takes the rest of the line, so
+    # the `| bash` inside the install command survives the split on `|`.
+    # Split as an array, the command lost it, and `curl` alone printed the
+    # whole installer to the terminal and still reported success.
+    local name bin cmd
+    IFS='|' read -r name bin cmd <<< "$entry"
     if has "$bin"; then
       ok "$name ($("$bin" --version 2>/dev/null || echo 'installed'))"
     else
       log "Installing $name..."
-      eval "$cmd" \
-        && ok "$name installed" \
-        || warn "$name install failed — try manually: $cmd"
+      if eval "$cmd"; then
+        # Trust the binary, not the exit code: installers drop it into
+        # ~/.local/bin, which may not be on PATH for this run yet.
+        ensure_local_bin_path
+        if has "$bin"; then
+          ok "$name installed"
+        else
+          warn "$name installer ran, but $bin is not on PATH — open a new shell"
+        fi
+      else
+        warn "$name install failed — try manually: $cmd"
+      fi
     fi
   done
 }

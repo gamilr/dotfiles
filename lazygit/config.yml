@@ -1,0 +1,5 @@
+# lazygit 0.62.2 - see `lazygit --config` for the full default set.
+gui:
+  # 'auto' (default) only splits the main pane while in diffing mode (W).
+  # 'always' shows every diff side-by-side, including plain file diffs.
+  splitDiff: always

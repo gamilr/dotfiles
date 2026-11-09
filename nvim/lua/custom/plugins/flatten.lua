@@ -1,0 +1,11 @@
+return {
+  'willothy/flatten.nvim',
+  lazy = false,
+  priority = 1001,
+  opts = {
+    window = {
+      open = 'current',
+    },
+    -- block_for defaults already include gitcommit and gitrebase
+  },
+}

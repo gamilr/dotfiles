@@ -1,0 +1,10 @@
+# Backups left by editors and ./setup
+*.bak-*
+*.bak.*
+
+# Credentials: never commit
+tmux/yt_music_token
+
+# Written per machine by Claude Code; can describe employer or private projects
+claude/agent-memory/
+claude/skills/synced/

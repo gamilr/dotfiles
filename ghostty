@@ -1,0 +1,90 @@
+# This is the configuration file for Ghostty.
+#
+# This template file has been automatically created at the following
+# path since Ghostty couldn't find any existing config files on your system:
+#
+#   ~/.config/ghostty/config
+#
+# The template does not set any default options, since Ghostty ships
+# with sensible defaults for all options. Users should only need to set
+# options that they want to change from the default.
+#
+# Run `ghostty +show-config --default --docs` to view a list of
+# all available config options and their default values.
+#
+# Additionally, each config option is also explained in detail
+# on Ghostty's website, at https://ghostty.org/docs/config.
+#
+# Ghostty can reload the configuration while running by using the menu
+# options or the bound key (default: Command + Shift + comma on macOS and
+# Control + Shift + comma on other platforms). Not all config options can be
+# reloaded while running; some only apply to new windows and others may require
+# a full restart to take effect.
+
+# Config syntax crash course
+# ==========================
+# # The config file consists of simple key-value pairs,
+# # separated by equals signs.
+# font-family = Iosevka
+# window-padding-x = 2
+#
+# # Spacing around the equals sign does not matter.
+# # All of these are identical:
+# key=value
+# key= value
+# key =value
+# key = value
+#
+# # Any line beginning with a # is a comment. It's not possible to put
+# # a comment after a config option, since it would be interpreted as a
+# # part of the value. For example, this will have a value of "#123abc":
+# background = #123abc
+#
+# # Empty values are used to reset config keys to default.
+# key =
+#
+# # Some config options have unique syntaxes for their value,
+# # which is explained in the docs for that config option.
+# # Just for example:
+# resize-overlay-duration = 4s 200ms
+
+theme = Everforest Dark Hard
+
+# 0xProto Nerd Font Mono — designed for code readability with strong
+# character disambiguation (0/O, 1/l/I).
+# Installed by `../setup` (brew cask on macOS, nix profile on Linux).
+font-family = 0xProto Nerd Font Mono
+font-size = 12
+
+# 0xProto ships intentionally thin/minimal icon glyphs that look small in
+# nvim NeoTree and tmux statusline. Substitute JetBrains Mono Nerd Font for
+# the Nerd Font icon ranges only — chunkier glyphs, no change to text.
+#   U+E000-U+F8FF  : Private Use Area (most Nerd Font icons)
+#   U+F0000-U+FFFFD: SPUA-A (Material Design icons)
+#   U+23FB-U+23FE  : IEC Power Symbols
+#   U+2B58        : Heavy circle (power on)
+#   U+E0A0-U+E0D7 : Powerline glyphs
+font-codepoint-map = U+E000-U+F8FF=JetBrainsMono Nerd Font Mono
+font-codepoint-map = U+F0000-U+FFFFD=JetBrainsMono Nerd Font Mono
+font-codepoint-map = U+23FB-U+23FE=JetBrainsMono Nerd Font Mono
+font-codepoint-map = U+2B58=JetBrainsMono Nerd Font Mono
+font-codepoint-map = U+E0A0-U+E0D7=JetBrainsMono Nerd Font Mono
+
+# Scale Nerd Font icon glyph height +20% to make NeoTree / tmux statusline
+# icons more prominent without enlarging text.
+adjust-icon-height = 120%
+
+# Send Shift+Enter as CSI-u so TUIs can distinguish it from Enter.
+keybind = shift+enter=csi:13;2u
+
+# Legacy encoding sends Alt+Shift+Enter the same as Alt+Enter; send CSI-u so tmux can match M-S-Enter.
+keybind = alt+shift+enter=csi:13;4u
+
+# Ghostty binds ctrl+alt+arrows to goto_split by default and consumes them
+# before the pane sees anything, which killed herdr's focus_pane_* bindings
+# (see [keys] in ~/.config/herdr/config.toml). Ghostty runs as `-e herdr` with
+# no Ghostty splits of its own, so these actions have nothing to act on.
+keybind = ctrl+alt+arrow_up=unbind
+keybind = ctrl+alt+arrow_down=unbind
+keybind = ctrl+alt+arrow_left=unbind
+keybind = ctrl+alt+arrow_right=unbind

@@ -1,0 +1,61 @@
+# Atuin config — https://docs.atuin.sh/configuration/config/
+# Cross-machine history: run `atuin register` (new account) or `atuin login`
+# on each machine after this is symlinked.
+
+# ── Search behavior ─────────────────────────────────────────────────────
+search_mode      = "fuzzy"          # fuzzy | prefix | full-text | skim
+filter_mode      = "global"         # global | host | session | directory
+                                    #   global = all history (best with sync on)
+filter_mode_shell_up_key_binding = "session"
+                                    # what the Up-arrow filters to (just this session feels intuitive)
+
+# Auto-import bash/zsh history on first run (one-shot)
+import_existing_history = true
+
+# Patterns to NEVER record (case-insensitive). Add anything that shouldn't be searchable.
+history_filter = [
+  "^secret",
+  "^password",
+  "^export .*KEY=",
+  "^export .*TOKEN=",
+]
+
+# Workspaces / cwd display
+cwd_filter = []
+
+# ── UI ──────────────────────────────────────────────────────────────────
+style          = "compact"           # compact | full | auto
+inline_height  = 30                  # rows used for compact-mode search
+show_preview   = true                # preview selected command
+show_help      = true                # show help bar at bottom
+auto_hide_height = 8                 # min lines available before auto-collapse
+
+# Theme — leave default; integrates with terminal colors
+# (uncomment for explicit Everforest-ish tint)
+# theme = "default"
+
+# ── Behavior ────────────────────────────────────────────────────────────
+update_check     = false             # don't ping for updates on each shell start
+secrets_filter   = true              # filter likely-secret values from being recorded
+enter_accept     = true              # Enter executes (vs. just placing into prompt)
+keymap_mode      = "auto"            # auto | emacs | vim-normal | vim-insert
+keymap_cursor    = { vim_insert = "blink-bar", vim_normal = "steady-block" }
+
+# Save command duration / exit status (improves "where did it succeed" queries)
+common_subcommands = ["cargo", "git", "go", "kubectl", "npm", "pnpm", "yarn", "make"]
+common_prefix     = ["sudo", "doas"]
+
+# ── Sync (cloud or self-hosted) ─────────────────────────────────────────
+# Off by default: shell history holds hostnames, paths and the odd secret, and
+# on a work machine it should not leave the box. Sync also needs `atuin login`.
+# To opt in on a machine where that is fine: auto_sync = true, then atuin login.
+# For self-hosted: set sync_address = "https://your-server"
+auto_sync          = false
+sync_address       = "https://api.atuin.sh"
+sync_frequency     = "10m"           # sync interval after shell start
+
+# ── Daemon (background sync, optional) ──────────────────────────────────
+# Use the daemon for snappier history pulls. macOS:
+#   brew services start atuin
+[daemon]
+enabled            = false           # set to true if you `brew services start atuin`

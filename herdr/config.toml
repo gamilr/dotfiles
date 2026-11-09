@@ -1,0 +1,207 @@
+onboarding = false
+# Mirrors the Omarchy tmux config in config/tmux/tmux.conf
+# tmux session -> herdr workspace, tmux window -> herdr tab, tmux pane -> herdr pane
+
+[theme]
+# Everforest is not a Herdr built-in, so it is a custom token set painted over
+# the closest warm dark base. Palette matches ~/.local/state/omarchy/current/theme
+# (everforest dark medium), so Herdr's chrome and the pane contents agree.
+name = "gruvbox"
+
+auto_switch = false
+
+[theme.custom]
+# Backgrounds: sidebar sits on the hard bg so it recedes behind the panes
+sidebar_bg = "#232a2e"      # bg_dim
+active_row_bg = "#2d353b"   # bg0, same as the terminal background
+surface_dim = "#343f44"     # bg2
+selection_bg = "#3d484d"    # bg3, alacritty's selection background
+
+# The active tab is drawn as panel_bg text on an accent background, so panel_bg
+# has to be dark for it to read - same colors as status-left's "#[fg=black,bg=blue]"
+panel_bg = "#2d353b"
+
+# Foregrounds
+text = "#d3c6aa"            # fg
+subtext0 = "#9da9a0"        # grey2
+overlay0 = "#475258"        # bg4 (muted): unfocused pane borders and titles recede so the accent-colored focused pane reads; Herdr has no border-weight setting
+
+# ui.accent = "blue" below resolves through this token set
+accent = "#7fbbb3"
+red = "#e67e80"
+green = "#a7c080"
+yellow = "#dbbc7f"
+peach = "#e69875"           # everforest orange
+mauve = "#d699b6"           # everforest purple
+blue = "#7fbbb3"
+teal = "#83c092"            # everforest aqua
+
+[terminal]
+# Matches -c "#{pane_current_path}" on every split, window, and session
+new_cwd = "follow"
+
+[keys]
+# tmux default prefix, so resize is C-b h/j/k/l in both Herdr and tmux muscle
+# memory. Herdr consumes C-b, so nvim never sees it: the <C-b>hjkl resize maps
+# in lua/custom/plugins/smart-splits.lua are inert inside a Herdr pane, as is
+# nvim's own C-b page-up.
+prefix = "ctrl+b"
+
+# Config and help
+reload_config = "prefix+q"
+help = "prefix+?"
+detach = "prefix+d"
+
+# Copy mode
+# tmux: bind -n M-j copy-mode, alongside the vi-style prefix+[
+copy_mode = ["prefix+[", "alt+j"]
+
+# Panes
+# tmux: bind - split-window -v (prefix+h freed for resize-pane -L)
+split_horizontal = ["prefix+minus", "alt+enter"]
+# tmux: bind '\\' split-window -h
+split_vertical = ["prefix+v", "prefix+\\", "alt+shift+enter"]
+close_pane = ["prefix+x", "alt+esc"]
+zoom = "prefix+z"
+last_pane = "prefix+;"
+
+focus_pane_left = "ctrl+alt+left"
+focus_pane_down = "ctrl+alt+down"
+focus_pane_up = "ctrl+alt+up"
+focus_pane_right = "ctrl+alt+right"
+
+resize_mode = ["prefix+ctrl+left", "prefix+ctrl+down", "prefix+ctrl+up", "prefix+ctrl+right"]
+
+# Like resize-pane on C-M-S-arrows, plus tmux's bind h/j/k/l resize-pane -L/-D/-U/-R
+resize_pane_left = ["ctrl+alt+shift+left", "prefix+h"]
+resize_pane_down = ["ctrl+alt+shift+down", "prefix+j"]
+resize_pane_up = ["ctrl+alt+shift+up", "prefix+k"]
+resize_pane_right = ["ctrl+alt+shift+right", "prefix+l"]
+
+# No tmux equivalent; herdr's default prefix+shift+p is taken by previous session
+rename_pane = "prefix+shift+o"
+
+# Windows -> tabs
+new_tab = "prefix+c"
+rename_tab = "prefix+r"
+# tmux kill-window is prefix+&; prefix+k is left to resize-pane -U as in tmux.conf
+close_tab = ["prefix+ampersand", "prefix+shift+x"]
+switch_tab = ["prefix+1..9", "alt+1..9"]
+previous_tab = ["prefix+p", "alt+left"]
+next_tab = ["prefix+n", "alt+right"]
+
+# Like swap-window -t -1/+1 on M-S-Left/Right
+move_tab_previous = "alt+shift+left"
+move_tab_next = "alt+shift+right"
+
+# Sessions -> workspaces
+new_workspace = "prefix+shift+c"
+rename_workspace = "prefix+shift+r"
+close_workspace = "prefix+shift+k"
+previous_workspace = ["prefix+shift+p", "alt+up"]
+next_workspace = ["prefix+shift+n", "alt+down"]
+
+# Smart pane switching with awareness of Vim splits, the vim-tmux-navigator
+# stanza from tmux.conf. Herdr keybindings cannot branch on the running process,
+# so the branch lives in scripts/nav.sh: it asks the server what the focused
+# pane is running, forwards the chord when that is vim/nvim, and moves Herdr
+# focus otherwise. Both scripts must stay executable - Herdr runs them through
+# the shell, and a non-executable file makes every one of these bindings a
+# silent no-op.
+#
+# smart-splits.nvim closes the loop from the other side, but it only ships
+# tmux/wezterm/kitty/zellij back-ends and knows nothing about Herdr, so the
+# nvim config carries its own: lua/smart-splits/mux/herdr.lua, selected by
+# vim.g.smart_splits_multiplexer_integration in custom/plugins/smart-splits.lua.
+# It calls `herdr pane focus` once the cursor is at the edge of nvim's splits.
+[[keys.command]]
+key = "ctrl+h"
+type = "shell"
+command = "$HOME/.config/herdr/scripts/nav.sh left ctrl+h"
+description = "focus pane left (vim-aware)"
+
+[[keys.command]]
+key = "ctrl+j"
+type = "shell"
+command = "$HOME/.config/herdr/scripts/nav.sh down ctrl+j"
+description = "focus pane down (vim-aware)"
+
+[[keys.command]]
+key = "ctrl+k"
+type = "shell"
+command = "$HOME/.config/herdr/scripts/nav.sh up ctrl+k"
+description = "focus pane up (vim-aware)"
+
+[[keys.command]]
+key = "ctrl+l"
+type = "shell"
+command = "$HOME/.config/herdr/scripts/nav.sh right ctrl+l"
+description = "focus pane right (vim-aware)"
+
+# tmux: bind C-l send-keys 'C-l' - plain ctrl+l now moves panes, so the shell
+# still needs a way through to clear-screen
+[[keys.command]]
+key = "prefix+ctrl+l"
+type = "shell"
+command = "$HOME/.config/herdr/scripts/send-key.sh ctrl+l"
+description = "clear screen"
+
+# tmux: bind a send-keys 'C-r' - atuin rebinds C-r to its interactive search
+[[keys.command]]
+key = "prefix+a"
+type = "shell"
+command = "$HOME/.config/herdr/scripts/send-key.sh ctrl+r"
+description = "atuin history search"
+
+[ui]
+accent = "blue"
+
+# Herdr's own boxed look rather than tmux's shared single-line dividers: every
+# pane keeps its own full border. Both stay on because a pane's manual name
+# (prefix+shift+o) is drawn on its top border, and any pane that loses that
+# border renders no name - Herdr has no in-pane title row like tmux's
+# pane-border-status.
+pane_gaps = true
+pane_outer_borders = true
+
+# tmux had no scrollbar column beside its panes
+pane_scrollbars = false
+
+# kill-window and kill-session never asked
+confirm_close = false
+
+# automatic-rename gave windows a name without prompting
+prompt_new_tab_name = false
+
+# set -g mouse on
+mouse_capture = true
+
+# tmux's status-right, minus the parts that need a pane: the zoom flag, the
+# metric segments, then #h. Command entries resolve on the Herdr server and
+# Herdr keeps the last line of output, so `herdr --remote` reports the machine
+# the panes run on. cpu/ram follow tmux's status-interval of 5s; battery moves
+# slowly and pmset is the slowest of the three, so it refreshes every 30s.
+# Herdr documents no ANSI support here, so scripts/status.sh sends plain text
+# and lets the bar carry the level instead of color.
+tab_bar_right = [
+  { type = "zoom" },
+  { type = "command", command = "~/.config/herdr/scripts/status.sh cpu", interval_seconds = 5, timeout_seconds = 2 },
+  { type = "command", command = "~/.config/herdr/scripts/status.sh ram", interval_seconds = 5, timeout_seconds = 2 },
+  { type = "command", command = "~/.config/herdr/scripts/status.sh bat", interval_seconds = 30, timeout_seconds = 2 },
+  { type = "hostname" },
+]
+
+# tmux drew "│" between the status-right segments
+tab_bar_right_separator = " │ "
+
+# set -g set-titles on / set -g set-titles-string '#h:#W', where tmux's #W was
+# the basename of the pane cwd. This is what Hyprland shows in the group bar,
+# and it resolves on the server so remote sessions name the remote host.
+window_title = "{hostname}: {workspace}"
+show_agent_labels_on_pane_borders = true
+
+agent_panel_sort = "spaces"
+status_indicators = "symbols"
+
+[ui.toast]
+delivery = "system"

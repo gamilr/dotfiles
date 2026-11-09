@@ -1,0 +1,1317 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Dotfiles setup script — auto-discovers items in this folder and
+# symlinks them to the correct system paths on macOS or Linux.
+#
+# Safe on a machine you do not fully own, such as a work laptop. By default it
+# only creates symlinks: it never touches git config, never replaces an
+# existing ~/.claude/settings.json, and leaves shell rc files alone.
+# Installing packages, Nix, fonts and agent CLIs (claude, opencode), and wiring
+# PATH, atuin, direnv and herdr into shell rc files, happen only with --install.
+#
+# Usage:
+#   ./setup                # link configs only
+#   ./setup --install      # also install deps and wire shell rc files
+#   ./setup --check        # verify without changes
+#   ./setup --help         # show help
+#
+# Adding new configs:
+#   1. Drop a dir into this folder (e.g. tmux/, alacritty/)
+#      → auto-linked to ~/.config/<name>
+#   2. If it needs a non-standard path, add an entry to get_dest().
+#   3. If only specific children should be linked (like claude/), add
+#      it to get_selective_items().
+
+DOTFILES="$(cd "$(dirname "$0")" && pwd)"
+
+# ── OS / distro detection ────────────────────────────────────────
+case "$(uname -s)" in
+  Darwin) OS="macos"; DISTRO="macos" ;;
+  Linux)
+    OS="linux"
+    if   command -v pacman  &>/dev/null; then DISTRO="arch"
+    elif command -v apt-get &>/dev/null; then DISTRO="debian"
+    else DISTRO="unknown"
+    fi
+    ;;
+  *) echo "Unsupported OS: $(uname -s)" >&2; exit 1 ;;
+esac
+
+# ── Skip list ─────────────────────────────────────────────────────
+SKIP=" .DS_Store setup setup-agents.sh README.md .git .gitignore .gitattributes "
+
+# ── Destination overrides ─────────────────────────────────────────
+get_dest() {
+  case "$1" in
+    ghostty)        echo "$HOME/.config/ghostty/config" ;;
+    # No gitconfig here on purpose: identity, credential helpers and URL
+    # rewrites belong to each machine, and on a work laptop to the employer.
+    claude)         echo "$HOME/.claude" ;;
+    # lazygit reads its config from the OS config dir, which is not XDG on
+    # macOS. Only config.yml is linked; see get_selective_items().
+    lazygit)
+      if [[ "$OS" == "macos" ]]
+        then echo "$HOME/Library/Application Support/lazygit"
+        else echo "$HOME/.config/lazygit"
+      fi ;;
+    *)         echo "$HOME/.config/$1" ;;
+  esac
+}
+
+# ── Selective linking ─────────────────────────────────────────────
+get_selective_items() {
+  case "$1" in
+    # hooks/ and skills/ back the SessionStart hooks in settings.json (herdr).
+    # settings.json is not in this list: link_claude_settings() links it only
+    # when the machine has none, so an existing (possibly managed) one survives.
+    claude)   echo "agents agent-memory statusline.sh hooks skills" ;;
+    opencode) echo "opencode.json oh-my-opencode.json package.json" ;;
+    # The rest of ~/.config/herdr is per-machine runtime state: sockets,
+    # logs, session.json, release-notes.json, config.toml backups.
+    herdr)    echo "config.toml scripts" ;;
+    # state.yml sits beside config.yml and is per-machine UI state that
+    # lazygit rewrites on exit.
+    lazygit)  echo "config.yml" ;;
+    *)        return 1 ;;
+  esac
+}
+
+# ── Colors ────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+log()  { echo -e "${CYAN}[setup]${NC} $*"; }
+ok()   { echo -e "${GREEN}  ✓${NC} $*"; }
+warn() { echo -e "${YELLOW}  !${NC} $*"; }
+err()  { echo -e "${RED}  ✗${NC} $*"; }
+hdr()  { echo -e "\n${BOLD}━━ $* ━━${NC}"; }
+
+# ── Dependency definitions ───────────────────────────────────────
+#
+# Neovim kickstart requires:
+#   Bootstrap: git make unzip gcc/clang curl tar python3
+#   Nix      : neovim tmux rg fd fzf jq lazygit direnv atuin nixd node/yarn/bun
+#   Python   : python3 + pynvim (jupytext, molten, mason python LSPs)
+#   Linux    : xclip / wl-clipboard (clipboard fallback if OSC52 unavailable)
+#
+# Tmux setup requires:
+#   tmux 3.2+ (OSC52 clipboard, hex colors). Linux also needs playerctl
+#   for the spotify segment in the status bar.
+#
+# Herdr requires:
+#   curl + awk (fetched by the official installer), and ~/.local/bin on PATH.
+#   The same PATH entry the claude / opencode installers drop their binaries
+#   into, so wiring it once covers all three.
+#
+# Mason auto-installs LSPs, formatters & linters (lua_ls,
+# rust_analyzer, prettier, stylua, ktlint, markdownlint, delve).
+
+has() { command -v "$1" &>/dev/null; }
+
+# ── Preflight: can we get root? ──────────────────────────────────
+# Package installs and the Nix installer need root. When there is no TTY —
+# running from an editor task, a CI step, or an agent shell — sudo cannot
+# prompt, and those steps fail one by one inside silenced subcommands.
+# Detect it once and say so plainly instead.
+SUDO_OK=true
+check_sudo() {
+  [[ "$OS" == "macos" ]] && return 0   # brew and pip run unprivileged
+  has sudo || { warn "sudo not found — steps needing root will be skipped"; return 1; }
+  sudo -n true 2>/dev/null && return 0
+  if [[ -t 0 ]]; then
+    log "sudo password required for package installs — you will be prompted."
+    return 0
+  fi
+  warn "No TTY available and sudo needs a password."
+  warn "Skipping Nix and distro packages. Re-run from a real terminal to finish."
+  return 1
+}
+
+# Bootstrap packages: generic_name|binary|macos_pkg|debian_pkg|arch_pkg
+# Binary column avoids a separate bin_for() lookup function.
+# Empty pkg column → skip that distro for that package.
+PACKAGES=(
+  "git|git|git|git|git"
+  "make|make|make|make|make"
+  "unzip|unzip|unzip|unzip|unzip"
+  "curl|curl|curl|curl|curl"
+  "gcc|gcc|gcc|gcc|gcc"
+  "python3|python3|python3|python3|python"
+)
+
+# Fonts — installed via the native package manager per OS, because each font
+# system has different validation rules:
+#   • macOS Core Text rejects fonts with the +x bit or unusual table layouts;
+#     brew casks are pre-validated and register reliably with Font Book.
+#   • Linux fontconfig follows symlinks fine, so nix profile works there.
+# 0xProto = clean, designed-for-coding sans monospace with strong character
+# disambiguation (0/O, 1/l/I); Nerd Font variant ships icon glyphs.
+# Format: display_name|macos_brew_cask|linux_nixpkgs_attr
+FONTS=(
+  "0xProto Nerd Font|font-0xproto-nerd-font|nerd-fonts._0xproto"
+)
+
+# Portable user tools installed through `nix profile` on macOS/Linux.
+# Format: generic_name|binary|nixpkgs_attr
+NIX_PROFILE_PACKAGES=(
+  "neovim|nvim|neovim"
+  "tmux|tmux|tmux"
+  "ripgrep|rg|ripgrep"
+  "fd|fd|fd"
+  "fzf|fzf|fzf"
+  "jq|jq|jq"
+  "lazygit|lazygit|lazygit"
+  "direnv|direnv|direnv"
+  "atuin|atuin|atuin"
+  "nixd|nixd|nixd"
+  "nixfmt|nixfmt|nixfmt"
+  "tree-sitter CLI|tree-sitter|tree-sitter"
+  "node.js|node|nodejs"
+  "npm|npm|nodejs"
+  "yarn|yarn|yarn"
+  "bun|bun|bun"
+)
+
+# Agent CLIs — single registry for install and check.
+# Format: name|binary|install_command
+AGENT_CLIS=(
+  "Claude Code|claude|curl -fsSL https://claude.ai/install.sh | bash"
+  "OpenCode|opencode|curl -fsSL https://opencode.ai/install | bash"
+)
+
+# Column index in PACKAGES per distro (after name|binary)
+distro_col() {
+  case "$1" in
+    macos)  echo 2 ;;
+    debian) echo 3 ;;
+    arch)   echo 4 ;;
+  esac
+}
+
+pkg_install_cmd() {
+  case "$1" in
+    macos)  echo "brew install" ;;
+    debian) echo "sudo apt-get install -y" ;;
+    arch)   echo "sudo pacman -S --noconfirm" ;;
+  esac
+}
+
+# ── Shared: nvim version check ───────────────────────────────────
+check_nvim_version() {
+  has nvim || return 0
+  local ver major minor
+  ver="$(nvim --version | head -1 | grep -oE '[0-9]+\.[0-9]+')"
+  major="${ver%%.*}"
+  minor="${ver#*.}"
+  if [[ "$major" -eq 0 && "$minor" -lt 11 ]]; then
+    warn "Neovim $ver detected — kickstart needs 0.11+."
+    warn "Mac:    brew upgrade neovim"
+    warn "Other:  install from https://github.com/neovim/neovim/releases"
+  else
+    ok "Neovim $ver"
+  fi
+}
+
+# ── Shared: tmux version check (OSC52 / hex colors need 3.2+) ────
+check_tmux_version() {
+  has tmux || return 0
+  local ver major minor
+  ver="$(tmux -V 2>/dev/null | awk '{print $2}' | tr -d 'a-z')"
+  major="${ver%%.*}"
+  minor="${ver#*.}"
+  if { [[ "$major" -eq 3 && "$minor" -ge 2 ]]; } || [[ "$major" -gt 3 ]]; then
+    ok "tmux $ver"
+  else
+    warn "tmux $ver — OSC52 clipboard and hex colors need 3.2+."
+    warn "Mac:    brew upgrade tmux"
+    warn "Debian: upgrade to 24.04+, or build from source / use ppa:pi-rho/dev"
+    warn "Arch:   already current via pacman"
+  fi
+}
+
+# ── Python: install pynvim (jupytext / molten / mason python LSPs) ─
+# Native package first: Arch and Debian 12+ enforce PEP 668 and neither ships
+# pip by default, so `python3 -m pip` is not a reliable entry point there.
+# Success is judged by importing the module, not by installer exit codes —
+# pipx in particular "succeeds" while installing an app nvim's python can't see.
+install_pynvim() {
+  has python3 || { warn "python3 missing — skipping pynvim"; return; }
+  if python3 -c "import pynvim" &>/dev/null; then
+    ok "pynvim installed"
+    return
+  fi
+  log "Installing pynvim..."
+
+  if [[ "$SUDO_OK" == true ]]; then
+    case "$DISTRO" in
+      arch)   sudo pacman -S --noconfirm python-pynvim &>/dev/null || true ;;
+      debian) sudo apt-get install -y python3-pynvim &>/dev/null || true ;;
+    esac
+  fi
+
+  if ! python3 -c "import pynvim" &>/dev/null; then
+    # --break-system-packages handles PEP 668 (Debian 12+/Arch).
+    python3 -m pip install --user --break-system-packages pynvim &>/dev/null \
+      || python3 -m pip install --user pynvim &>/dev/null \
+      || true
+  fi
+
+  if python3 -c "import pynvim" &>/dev/null; then
+    ok "pynvim installed"
+  else
+    warn "pynvim install failed — try manually:"
+    warn "  arch:   sudo pacman -S python-pynvim"
+    warn "  debian: sudo apt-get install python3-pynvim"
+    warn "  macos:  python3 -m pip install --user pynvim"
+  fi
+}
+
+# ── Wire atuin into a shell rc (idempotent, managed block) ───────
+ATUIN_BLOCK_MARK="# >>> atuin init (managed by dotfiles/setup) >>>"
+ATUIN_BLOCK_END="# <<< atuin init <<<"
+wire_atuin_shell() {
+  has atuin || { warn "atuin missing — skipping $2 hook"; return 0; }
+  local rc="$1" shell="$2"
+  if [[ ! -f "$rc" ]]; then
+    log "Creating $rc for atuin $shell init..."
+    : > "$rc"
+  fi
+  if grep -Fq "$ATUIN_BLOCK_MARK" "$rc"; then
+    ok "atuin already wired into $rc"
+    return
+  fi
+  log "Adding atuin init to $rc..."
+  cat >> "$rc" <<EOF
+
+$ATUIN_BLOCK_MARK
+if command -v atuin >/dev/null 2>&1; then
+  eval "\$(atuin init $shell)"
+fi
+$ATUIN_BLOCK_END
+EOF
+  ok "atuin init added to $rc"
+}
+
+# ── Nix: Determinate Nix installer (cross-platform, official) ────
+# Idempotent: if `nix` is already on PATH (any flavor — Determinate, official,
+# nix-darwin, NixOS), we leave it alone. The user can upgrade with
+# `determinate-nixd upgrade` (Determinate) or `nix upgrade-nix`.
+install_nix() {
+  if has nix; then
+    ok "nix ($(nix --version 2>/dev/null | awk '{print $NF}'))"
+    return
+  fi
+  if [[ "$SUDO_OK" != true ]]; then
+    warn "nix install needs root — skipped"
+    return
+  fi
+  log "Installing Determinate Nix..."
+  if curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix \
+      | sh -s -- install --determinate --no-confirm; then
+    # Source the daemon profile so the rest of this script sees `nix` immediately.
+    [[ -f /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ]] && \
+      . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+    ok "nix installed — restart your shell to pick up the daemon env globally"
+  else
+    warn "nix install failed — see https://install.determinate.systems"
+  fi
+}
+
+# ── Nix profile: portable user tools ──────────────────────────────
+ensure_nix_profile_path() {
+  local profile_bin="$HOME/.nix-profile/bin"
+  if [[ -d "$profile_bin" && ":$PATH:" != *":$profile_bin:"* ]]; then
+    export PATH="$profile_bin:$PATH"
+  fi
+}
+
+# ~/.local/bin is where the herdr, claude and opencode installers land their
+# binaries. None of them wire it into PATH, so do it here for the rest of this
+# run; wire_local_bin_path_shell() makes it stick for future shells.
+ensure_local_bin_path() {
+  local local_bin="$HOME/.local/bin"
+  if [[ -d "$local_bin" && ":$PATH:" != *":$local_bin:"* ]]; then
+    export PATH="$local_bin:$PATH"
+  fi
+}
+
+nix_profile_has_attr() {
+  local profile
+  profile="$(nix profile list 2>/dev/null || true)"
+  grep -Eq "Flake attribute:.*\.$1$" <<< "$profile"
+}
+
+install_nix_profile_tools() {
+  has nix || { warn "nix not available — skipping Nix profile tools"; return; }
+  ensure_nix_profile_path
+  log "Installing portable tools via Nix profile..."
+
+  for entry in "${NIX_PROFILE_PACKAGES[@]}"; do
+    IFS='|' read -ra f <<< "$entry"
+    local name="${f[0]}" bin="${f[1]}" attr="${f[2]}"
+
+    if nix_profile_has_attr "$attr"; then
+      if has "$bin"; then ok "$name (nix profile)"; else warn "$name installed, but $bin is not on PATH"; fi
+      continue
+    fi
+
+    log "Installing $name (nixpkgs#$attr)..."
+    if nix profile add "nixpkgs#$attr"; then
+      ensure_nix_profile_path
+      if has "$bin"; then ok "$name installed"; else warn "$name installed, but $bin is not on PATH yet"; fi
+    else
+      warn "$name install failed — try manually: nix profile add nixpkgs#$attr"
+    fi
+  done
+}
+
+# Nix drops fonts in ~/.nix-profile/share/fonts, which fontconfig does not
+# scan by default — so `nix profile list` shows the font installed while
+# `fc-list` finds nothing and apps fall back silently. Link it into
+# ~/.local/share/fonts, which fontconfig does scan, then refresh the cache.
+register_nix_fonts_linux() {
+  [[ "$OS" == "linux" ]] || return 0
+  local src="$HOME/.nix-profile/share/fonts/truetype/NerdFonts"
+  local dst="$HOME/.local/share/fonts/nix-nerdfonts"
+  [[ -d "$src" ]] || return 0
+  mkdir -p "$HOME/.local/share/fonts"
+  if [[ "$(readlink "$dst" 2>/dev/null)" != "$src" ]]; then
+    ln -sfn "$src" "$dst"
+    ok "nix fonts linked into ~/.local/share/fonts"
+  fi
+  has fc-cache && fc-cache -f &>/dev/null || true
+}
+
+install_fonts() {
+  log "Installing fonts..."
+  for entry in "${FONTS[@]}"; do
+    IFS='|' read -ra f <<< "$entry"
+    local name="${f[0]}" cask="${f[1]}" attr="${f[2]}"
+
+    case "$OS" in
+      macos)
+        if brew list --cask "$cask" &>/dev/null; then
+          ok "$name (brew cask)"
+        else
+          log "Installing $name via brew cask..."
+          brew install --cask "$cask" &>/dev/null \
+            && ok "$name installed" \
+            || warn "$name install failed — try manually: brew install --cask $cask"
+        fi
+        ;;
+      linux)
+        has nix || { warn "$name: nix not available, skipping"; continue; }
+        if nix_profile_has_attr "$attr"; then
+          ok "$name (nix profile)"
+        else
+          log "Installing $name (nixpkgs#$attr)..."
+          if nix profile add "nixpkgs#$attr"; then
+            ok "$name installed"
+          else
+            warn "$name install failed — try manually: nix profile add nixpkgs#$attr"
+          fi
+        fi
+        ;;
+    esac
+  done
+
+  register_nix_fonts_linux
+}
+
+NIX_PROFILE_PATH_BLOCK_MARK="# >>> nix profile path (managed by dotfiles/setup) >>>"
+NIX_PROFILE_PATH_BLOCK_END="# <<< nix profile path <<<"
+wire_nix_profile_path_shell() {
+  local rc="$1"
+  if [[ ! -f "$rc" ]]; then
+    log "Creating $rc for Nix profile PATH..."
+    : > "$rc"
+  fi
+  if grep -Fq "$NIX_PROFILE_PATH_BLOCK_MARK" "$rc"; then
+    ok "nix profile PATH already wired into $rc"
+    return
+  fi
+
+  log "Adding nix profile PATH to $rc..."
+  local tmp
+  tmp="$(mktemp)"
+  {
+    echo "$NIX_PROFILE_PATH_BLOCK_MARK"
+    echo 'if [ -d "$HOME/.nix-profile/bin" ]; then'
+    echo '  case ":$PATH:" in'
+    echo '    *":$HOME/.nix-profile/bin:"*) ;;'
+    echo '    *) export PATH="$HOME/.nix-profile/bin:$PATH" ;;'
+    echo '  esac'
+    echo 'fi'
+    echo "$NIX_PROFILE_PATH_BLOCK_END"
+    echo ""
+    cat "$rc"
+  } > "$tmp"
+  mv "$tmp" "$rc"
+  ok "nix profile PATH added to $rc"
+}
+
+LOCAL_BIN_PATH_BLOCK_MARK="# >>> local bin path (managed by dotfiles/setup) >>>"
+LOCAL_BIN_PATH_BLOCK_END="# <<< local bin path <<<"
+wire_local_bin_path_shell() {
+  local rc="$1"
+  if [[ ! -f "$rc" ]]; then
+    log "Creating $rc for ~/.local/bin PATH..."
+    : > "$rc"
+  fi
+  if grep -Fq "$LOCAL_BIN_PATH_BLOCK_MARK" "$rc"; then
+    ok "~/.local/bin PATH already wired into $rc"
+    return
+  fi
+
+  log "Adding ~/.local/bin PATH to $rc..."
+  local tmp
+  tmp="$(mktemp)"
+  {
+    echo "$LOCAL_BIN_PATH_BLOCK_MARK"
+    echo 'if [ -d "$HOME/.local/bin" ]; then'
+    echo '  case ":$PATH:" in'
+    echo '    *":$HOME/.local/bin:"*) ;;'
+    echo '    *) export PATH="$HOME/.local/bin:$PATH" ;;'
+    echo '  esac'
+    echo 'fi'
+    echo "$LOCAL_BIN_PATH_BLOCK_END"
+    echo ""
+    cat "$rc"
+  } > "$tmp"
+  mv "$tmp" "$rc"
+  ok "~/.local/bin PATH added to $rc"
+}
+
+# ── herdr autorun: exec a pane's command before the rc runs ───
+# Appended, not prepended like the PATH blocks: this is an exec trampoline, so
+# everything else the file exports has to be in place before it fires.
+HERDR_AUTORUN_BLOCK_MARK="# >>> herdr autorun (managed by dotfiles/setup) >>>"
+HERDR_AUTORUN_BLOCK_END="# <<< herdr autorun <<<"
+wire_herdr_autorun_shell() {
+  local rc="$1"
+  if [[ ! -f "$rc" ]]; then
+    log "Creating $rc for herdr autorun..."
+    : > "$rc"
+  fi
+  if grep -Fq "$HERDR_AUTORUN_BLOCK_MARK" "$rc"; then
+    ok "herdr autorun already wired into $rc"
+    return
+  fi
+
+  log "Adding herdr autorun to $rc..."
+  {
+    echo ""
+    echo "$HERDR_AUTORUN_BLOCK_MARK"
+    cat <<'HERDR_AUTORUN_BLOCK'
+# `herdr pane split` has no --command, unlike `tmux split-window '<cmd>'` which
+# execs the command as the pane process. Without this, nvim has to open a pane,
+# wait for the shell prompt, then type the command in: ~350ms against tmux's
+# ~65ms. Taking the command from the pane env and exec'ing it here skips the rc
+# entirely and lands at parity. Paired with nvim/lua/custom/util/herdr.lua,
+# which sets HERDR_AUTORUN on the split and falls back to typing without it.
+case $- in
+  *i*)
+    if [ -n "$HERDR_AUTORUN" ]; then
+      _herdr_autorun="$HERDR_AUTORUN"
+      # Unset before exec so the command and anything it spawns never re-trigger.
+      unset HERDR_AUTORUN
+      # Self-sufficient about PATH so this block works wherever it is placed:
+      # agent CLIs live in ~/.local/bin, and both command -v and env need it.
+      case ":$PATH:" in
+        *":$HOME/.local/bin:"*) ;;
+        *) PATH="$HOME/.local/bin:$PATH"; export PATH ;;
+      esac
+      # The command arrives as "VAR=val VAR=val claude". Find the first word
+      # that is not an assignment and confirm it resolves: once exec'd there is
+      # no way back, so an unrunnable command takes the pane down with it, a
+      # silent blink with no output to explain it.
+      eval "_herdr_words=($_herdr_autorun)"
+      _herdr_cmd=""
+      for _herdr_w in "${_herdr_words[@]}"; do
+        case "$_herdr_w" in
+          *=*) ;;
+          *) _herdr_cmd="$_herdr_w"; break ;;
+        esac
+      done
+      if [ -n "$_herdr_cmd" ] && command -v "$_herdr_cmd" >/dev/null 2>&1; then
+        unset _herdr_words _herdr_cmd _herdr_w
+        # Through env, not a bare exec: zsh's exec takes the first word as the
+        # command name, so leading assignments fail it with
+        # "command not found: VAR=val".
+        eval "exec env $_herdr_autorun"
+      fi
+      printf 'herdr autorun skipped, command not runnable: %s\n' "$_herdr_autorun" >&2
+      unset _herdr_autorun _herdr_words _herdr_cmd _herdr_w
+    fi
+    ;;
+esac
+HERDR_AUTORUN_BLOCK
+    echo "$HERDR_AUTORUN_BLOCK_END"
+  } >> "$rc"
+  ok "herdr autorun added to $rc"
+}
+
+# ── direnv: wire `direnv hook` into a shell rc (idempotent block) ─
+DIRENV_BLOCK_MARK="# >>> direnv hook (managed by dotfiles/setup) >>>"
+DIRENV_BLOCK_END="# <<< direnv hook <<<"
+wire_direnv_shell() {
+  has direnv || { warn "direnv missing — skipping $2 hook"; return 0; }
+  local rc="$1" shell="$2"
+  # Create rc if missing — the user asked for the hook, give it a home.
+  if [[ ! -f "$rc" ]]; then
+    log "Creating $rc for direnv $shell hook..."
+    : > "$rc"
+  fi
+  if grep -Fq "$DIRENV_BLOCK_MARK" "$rc"; then
+    ok "direnv already wired into $rc"
+    return
+  fi
+  log "Adding direnv hook to $rc..."
+  cat >> "$rc" <<EOF
+
+$DIRENV_BLOCK_MARK
+if command -v direnv >/dev/null 2>&1; then
+  eval "\$(direnv hook $shell)"
+fi
+$DIRENV_BLOCK_END
+EOF
+  ok "direnv hook added to $rc"
+}
+
+# ── Linux only: playerctl for tmux spotify status segment ────────
+install_playerctl_linux() {
+  [[ "$OS" != "linux" ]] && return
+  if has playerctl; then ok "playerctl"; return; fi
+  if [[ "$SUDO_OK" != true ]]; then
+    warn "playerctl install needs root — skipped"
+    return
+  fi
+  log "Installing playerctl (tmux spotify status)..."
+  case "$DISTRO" in
+    arch)   sudo pacman -S --noconfirm playerctl &>/dev/null && ok "playerctl" || warn "playerctl install failed" ;;
+    debian) sudo apt-get install -y playerctl &>/dev/null && ok "playerctl" || warn "playerctl install failed" ;;
+  esac
+}
+
+# ── Herdr: terminal workspace manager for AI coding agents ───────
+# Official installer (https://herdr.dev/install.sh): reads the same release
+# manifest `herdr update` uses, verifies a SHA-256, and drops one static binary
+# into ~/.local/bin. No root, macOS + Linux, x86_64 + aarch64.
+#
+# Idempotent and deliberately non-destructive — if herdr is already on PATH we
+# leave it alone whatever installed it. On Omarchy it comes from the `omarchy`
+# pacman repo as /usr/bin/herdr, and running the curl installer there would
+# leave a second binary in ~/.local/bin with PATH order deciding the winner.
+# Upgrades belong to whoever owns the install: `herdr update` for a curl or
+# brew copy, `pacman -Syu` for the packaged one.
+install_herdr() {
+  ensure_local_bin_path
+  if has herdr; then
+    ok "herdr $(herdr --version 2>/dev/null | awk '{print $2}') ($(command -v herdr))"
+    return
+  fi
+  # Both are fetched by install.sh itself; fail with its own message, not a
+  # half-finished download.
+  if ! has curl || ! has awk; then
+    warn "herdr install needs curl and awk — skipped"
+    return
+  fi
+  log "Installing herdr (herdr.dev/install.sh)..."
+  if curl -fsSL https://herdr.dev/install.sh | sh; then
+    ensure_local_bin_path
+    if has herdr; then
+      ok "herdr $(herdr --version 2>/dev/null | awk '{print $2}') installed"
+    else
+      warn "herdr installed, but not on PATH yet — restart your shell"
+    fi
+  else
+    warn "herdr install failed — try manually: curl -fsSL https://herdr.dev/install.sh | sh"
+  fi
+}
+
+# ── Herdr agent integrations ─────────────────────────────────────
+# `herdr integration install` writes a per-agent hook script and points the
+# agent's config at it. The hook is generated and versioned by Herdr (it says so
+# in its own header), so it is deliberately NOT a tracked dotfile — each machine
+# installs its own. We only make sure it is present and current.
+install_herdr_integrations() {
+  has herdr || return 0
+  local status
+  status="$(herdr integration status 2>/dev/null)" || return 0
+  local agent
+  for agent in claude opencode codex; do
+    case "$status" in
+      *"$agent: current"*) ok "herdr $agent integration" ;;
+      *"$agent: "*)
+        log "Installing herdr $agent integration..."
+        herdr integration install "$agent" >/dev/null 2>&1 \
+          && ok "herdr $agent integration installed" \
+          || warn "herdr $agent integration install failed"
+        ;;
+    esac
+  done
+}
+
+# ── Claude: keep synced settings.json free of machine-specific paths ──
+# Herdr writes an ABSOLUTE hook path into ~/.claude/settings.json whenever it
+# installs or updates the claude integration. settings.json is a tracked,
+# synced dotfile, so "/home/you/..." lands on a Mac (or "/Users/you/..." on
+# Linux) and the hook silently fails there. Rewrite it to $HOME, which the
+# shell running the hook expands on whichever machine it lands.
+normalize_claude_hook_paths() {
+  local settings="$DOTFILES/claude/settings.json"
+  [[ -f "$settings" ]] || return 0
+  has python3 || { warn "python3 missing — skipped settings.json path normalization"; return 0; }
+  HOOK_SETTINGS="$settings" python3 - <<'PY'
+import json, os, re, sys
+
+path = os.environ["HOOK_SETTINGS"]
+# This file is synced across machines, so a path baked in on the Mac
+# (/Users/x) has to be fixed on Linux and vice versa: match any home prefix,
+# not just this machine's.
+home = os.path.expanduser("~").rstrip("/")
+HOME_RE = re.compile(r"(?:/Users|/home)/[^/'\"\s]+|" + re.escape(home))
+try:
+    data = json.loads(open(path).read())
+except Exception as exc:
+    print(f"parse failed: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+changed = False
+
+def fix(node):
+    global changed
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "command" and isinstance(value, str) and HOME_RE.search(value):
+                # Single quotes block expansion, so they have to become double.
+                new = re.sub(r"'(" + HOME_RE.pattern + r")([^']*)'",
+                             lambda m: '"$HOME' + m.group(2) + '"', value)
+                new = HOME_RE.sub("$HOME", new)
+                if new != value:
+                    node[key] = new
+                    changed = True
+            else:
+                fix(value)
+    elif isinstance(node, list):
+        for item in node:
+            fix(item)
+
+hooks = data.get("hooks", {})
+fix(hooks)
+
+# `herdr integration install` appends a fresh entry with an absolute path
+# instead of recognising the $HOME one already there, and it re-runs on every
+# hook version bump. Once the paths above are normalized the copies are
+# identical, so collapse them or the hook fires once per install ever done.
+for event, entries in hooks.items():
+    if not isinstance(entries, list):
+        continue
+    seen, kept = set(), []
+    for entry in entries:
+        key = json.dumps(entry, sort_keys=True)
+        if key in seen:
+            changed = True
+            continue
+        seen.add(key)
+        kept.append(entry)
+    if len(kept) != len(entries):
+        hooks[event] = kept
+
+if changed:
+    open(path, "w").write(json.dumps(data, indent=2) + "\n")
+    print("rewritten")
+PY
+  local rc=$?
+  if [[ $rc -eq 0 ]]; then
+    ok "claude hooks are \$HOME-relative and free of duplicates"
+  else
+    warn "could not normalize claude hook paths"
+  fi
+}
+
+# ── Claude: settings.json without clobbering ────────────────────
+# A work machine may already have ~/.claude/settings.json carrying the
+# employer's setup: Bedrock or Vertex routing, an apiKeyHelper, proxy env,
+# policy. Replacing it with this repo's copy would break that, so link only
+# when nothing is there, and otherwise print how to merge by hand.
+link_claude_settings() {
+  local mode="$1"
+  local src="$DOTFILES/claude/settings.json"
+  local dst="$HOME/.claude/settings.json"
+  [[ -f "$src" ]] || return 0
+  if [[ -L "$dst" && "$(readlink "$dst")" == "$src" ]]; then
+    ok "  settings.json"
+  elif [[ -L "$dst" ]]; then
+    warn "  settings.json -> $(readlink "$dst") (not this repo's copy; left alone)"
+    warn "    Remove that link and rerun to use this repo's settings."
+  elif [[ -e "$dst" ]]; then
+    warn "  settings.json: kept the existing $dst (not replaced)"
+    warn "    To layer this repo's settings over it, merge by hand and review:"
+    warn "    jq -s '.[0] * .[1]' \"$dst\" \"$src\""
+  elif [[ "$mode" == "check" ]]; then
+    err "  settings.json (missing)"
+  else
+    mkdir -p "${dst%/*}"
+    ln -s "$src" "$dst"
+    ok "$dst -> $src"
+  fi
+}
+
+# ── Git: keep machine-specific Claude keys out of commits ────────
+# This repo is public and claude/settings.json can be a live, linked file.
+# Claude Code writes keys into it that describe the machine it runs on:
+# autoMode summarises the org's repos, cloud accounts and buckets, and env or
+# the *Helper / aws* keys carry endpoints and credential plumbing. The clean
+# filter named in .gitattributes drops them on `git add`; the working file
+# keeps them. Git never runs filters a clone ships with, so set it here.
+SETTINGS_FILTER_CLEAN="jq --indent 2 'del(.autoMode, .env, .apiKeyHelper, .awsAuthRefresh, .awsCredentialExport, .otelHeadersHelper)'"
+configure_repo_filters() {
+  git -C "$DOTFILES" rev-parse --git-dir &>/dev/null || return 0
+  if ! has jq; then
+    warn "jq missing — commit filter for claude/settings.json not set; do not commit that file"
+    return 0
+  fi
+  git -C "$DOTFILES" config filter.claude-settings.clean "$SETTINGS_FILTER_CLEAN"
+  # required without a smudge side would fail every checkout of the file.
+  git -C "$DOTFILES" config filter.claude-settings.smudge cat
+  git -C "$DOTFILES" config filter.claude-settings.required true
+  ok "commit filter strips autoMode, env and auth helpers from claude/settings.json"
+}
+
+check_repo_filters() {
+  git -C "$DOTFILES" rev-parse --git-dir &>/dev/null || return 0
+  if [[ "$(git -C "$DOTFILES" config --get filter.claude-settings.clean 2>/dev/null)" == "$SETTINGS_FILTER_CLEAN" ]]; then
+    ok "claude/settings.json commit filter"
+  else
+    err "claude/settings.json commit filter not set — run ./setup before committing"
+  fi
+}
+
+# ── Recommendations the script doesn't auto-install ──────────────
+recommend_optional() {
+  hdr "Recommended (manual)"
+  echo "  Ghostty terminal:"
+  case "$DISTRO" in
+    macos)  echo "    brew install --cask ghostty  (native app; keep outside Nix profile)" ;;
+    arch)   echo "    sudo pacman -S ghostty  (Omarchy: pre-installed)" ;;
+    debian) echo "    No official .deb yet — see https://ghostty.org/docs" ;;
+  esac
+  echo ""
+  echo "  git difftool / mergetool in nvim (codediff.nvim; edits your global git config):"
+  cat <<'EOF'
+    git config --global diff.tool codediff
+    git config --global difftool.codediff.cmd 'sub=file; [ -d "$LOCAL" ] && sub=dir; env -u NVIM nvim +"CodeDiff --exit-on-close $sub $LOCAL $REMOTE"'
+    git config --global merge.tool codediff
+    git config --global mergetool.codediff.cmd 'env -u NVIM nvim "$MERGED" +"CodeDiff --exit-on-close merge $MERGED"'
+EOF
+  echo ""
+}
+
+# ── Install dependencies ─────────────────────────────────────────
+install_deps() {
+  hdr "Dependencies"
+  log "Distro: $DISTRO"
+
+  check_sudo || SUDO_OK=false
+
+  if [[ "$DISTRO" == "unknown" ]]; then
+    local names=()
+    for entry in "${PACKAGES[@]}"; do names+=("${entry%%|*}"); done
+    warn "Unknown Linux distro (only Arch and Debian/Ubuntu are supported)."
+    warn "Please install manually: ${names[*]}"
+    return 0
+  fi
+
+  # On macOS, ensure Homebrew exists
+  if [[ "$DISTRO" == "macos" ]] && ! has brew; then
+    log "Installing Homebrew..."
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  fi
+
+  # On Debian, update package index once
+  if [[ "$DISTRO" == "debian" ]]; then
+    log "Updating apt index..."
+    sudo apt-get update -qq
+  fi
+
+  local col
+  col="$(distro_col "$DISTRO")"
+  local install_cmd
+  install_cmd="$(pkg_install_cmd "$DISTRO")"
+  local to_install=()
+
+  for entry in "${PACKAGES[@]}"; do
+    IFS='|' read -ra f <<< "$entry"
+    local name="${f[0]}" bin="${f[1]}" pkg="${f[$col]}"
+
+    [[ -z "$pkg" ]] && continue
+
+    if has "$bin"; then
+      ok "$name ($bin found)"
+    else
+      to_install+=("$pkg")
+      warn "$name not found — will install $pkg"
+    fi
+  done
+
+  # Linux-only: clipboard tool. Match tmux.conf's Wayland/X11 fallback.
+  if [[ "$OS" == "linux" ]]; then
+    if has xclip || has xsel || has wl-copy; then
+      ok "clipboard tool found"
+    else
+      if [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+        case "$DISTRO" in
+          arch)   to_install+=("wl-clipboard") ;;
+          debian) to_install+=("wl-clipboard") ;;
+        esac
+        warn "No clipboard tool — will install wl-clipboard"
+      else
+        to_install+=("xclip")
+        warn "No clipboard tool — will install xclip"
+      fi
+    fi
+  fi
+
+  if [[ ${#to_install[@]} -eq 0 ]]; then
+    log "All dependencies already installed."
+  elif [[ "$SUDO_OK" != true ]]; then
+    warn "Cannot install without root: ${to_install[*]}"
+  else
+    echo ""
+    log "Installing: ${to_install[*]}"
+    # Don't let one failed package abort the whole run under `set -e`.
+    if $install_cmd "${to_install[@]}"; then
+      ok "Package installation complete"
+    else
+      warn "Package installation failed — install manually: ${to_install[*]}"
+    fi
+  fi
+
+  install_pynvim
+  install_playerctl_linux
+  install_herdr
+  install_nix
+  install_nix_profile_tools
+  install_fonts
+  wire_nix_profile_path_shell "$HOME/.zshrc"
+  wire_nix_profile_path_shell "$HOME/.bashrc"
+  wire_nix_profile_path_shell "$HOME/.profile"
+  wire_local_bin_path_shell "$HOME/.zshrc"
+  wire_local_bin_path_shell "$HOME/.bashrc"
+  wire_local_bin_path_shell "$HOME/.profile"
+  wire_atuin_shell  "$HOME/.zshrc"  zsh
+  wire_atuin_shell  "$HOME/.bashrc" bash
+  wire_direnv_shell "$HOME/.zshrc"  zsh
+  wire_direnv_shell "$HOME/.bashrc" bash
+  wire_herdr_autorun_shell "$HOME/.zshenv"
+  wire_herdr_autorun_shell "$HOME/.bashrc"
+  check_nvim_version
+  check_tmux_version
+}
+
+# ── Install / check agent CLIs ───────────────────────────────────
+install_agents() {
+  hdr "Agent CLIs"
+  for entry in "${AGENT_CLIS[@]}"; do
+    IFS='|' read -ra f <<< "$entry"
+    local name="${f[0]}" bin="${f[1]}" cmd="${f[2]}"
+    if has "$bin"; then
+      ok "$name ($("$bin" --version 2>/dev/null || echo 'installed'))"
+    else
+      log "Installing $name..."
+      eval "$cmd" \
+        && ok "$name installed" \
+        || warn "$name install failed — try manually: $cmd"
+    fi
+  done
+}
+
+check_agents() {
+  hdr "Agent CLIs"
+  for entry in "${AGENT_CLIS[@]}"; do
+    IFS='|' read -ra f <<< "$entry"
+    local name="${f[0]}" bin="${f[1]}"
+    if has "$bin"; then ok "$name"; else err "$name not found"; fi
+  done
+  check_opencode_version
+}
+
+# ── OpenCode version check (nvim's opencode.nvim needs v2+) ──────
+# opencode.nvim is tracked on `main`, which only talks to the OpenCode v2
+# background service. A machine that kept v1 (install_agents only installs a
+# missing CLI) gets a <leader>aa pane that cannot connect, so flag it here.
+check_opencode_version() {
+  has opencode || return 0
+  local ver major
+  # `|| true`: no match under pipefail would otherwise abort the whole run.
+  ver="$(opencode --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
+  major="${ver%%.*}"
+  if [[ -z "$major" ]]; then
+    warn "Could not read the OpenCode version — opencode.nvim needs v2+."
+  elif [[ "$major" -lt 2 ]]; then
+    warn "OpenCode $ver detected — opencode.nvim (main) needs v2+."
+    warn "Upgrade: opencode upgrade"
+  else
+    ok "OpenCode $ver (v2, matches opencode.nvim)"
+  fi
+}
+
+# ── Core: link or check a single src → dst ───────────────────────
+link_path() {
+  local src="$1" dst="$2"
+
+  mkdir -p "${dst%/*}"
+
+  if [[ -L "$dst" ]]; then
+    local target
+    target="$(readlink "$dst")"
+    if [[ "$target" == "$src" ]]; then
+      ok "$dst (already linked)"
+      return 0
+    else
+      warn "Relinking $dst (was $target)"
+      rm "$dst"
+    fi
+  fi
+
+  if [[ -e "$dst" ]]; then
+    if [[ ! -e "$src" ]]; then
+      log "Migrating $dst -> $src"
+      mv "$dst" "$src"
+    else
+      local bak="${dst}.bak.$(date +%s)"
+      warn "Backing up $dst -> $bak"
+      mv "$dst" "$bak"
+    fi
+  fi
+
+  if [[ ! -e "$src" ]]; then
+    if [[ "$(basename "$src")" == *.* ]]; then
+      touch "$src"
+      warn "Created empty $src"
+    else
+      mkdir -p "$src"
+      warn "Created empty directory $src"
+    fi
+  fi
+
+  ln -s "$src" "$dst"
+  ok "$dst -> $src"
+}
+
+check_path() {
+  local src="$1" dst="$2" label="$3"
+  if [[ -L "$dst" ]]; then
+    local target
+    target="$(readlink "$dst")"
+    if [[ "$target" == "$src" ]]; then
+      ok "$label"
+    else
+      warn "$label -> $target (expected $src)"
+    fi
+  elif [[ -e "$dst" ]]; then
+    err "$label (exists but not a symlink)"
+  else
+    err "$label (missing)"
+  fi
+}
+
+# ── Process a single dotfiles item ───────────────────────────────
+apply_link() {
+  local src="$1" dst="$2" label="$3" mode="$4"
+  if [[ "$mode" == "check" ]]; then
+    check_path "$src" "$dst" "$label"
+  else
+    link_path "$src" "$dst"
+  fi
+}
+
+process_item() {
+  local item="$1" mode="$2"
+  local src="$DOTFILES/$item"
+  local selective_items
+
+  if selective_items="$(get_selective_items "$item" 2>/dev/null)"; then
+    local dst_base
+    dst_base="$(get_dest "$item")"
+    log "$item (selective -> $dst_base)"
+    for child in $selective_items; do
+      apply_link "$src/$child" "$dst_base/$child" "  $child" "$mode"
+    done
+    if [[ "$item" == "claude" ]]; then
+      link_claude_settings "$mode"
+    fi
+  else
+    local dst
+    dst="$(get_dest "$item")"
+    log "$item -> $dst"
+    apply_link "$src" "$dst" "  $item" "$mode"
+  fi
+}
+
+# ── Discover all items in dotfiles folder ─────────────────────────
+discover_items() {
+  for entry in "$DOTFILES"/*; do
+    local name
+    name="$(basename "$entry")"
+    [[ "$SKIP" == *" $name "* ]] && continue
+    # Timestamped backups this script and its editors leave behind are not
+    # configs; without this they get linked into ~/.config as dead entries.
+    [[ "$name" == *.bak-* || "$name" == *.bak.* ]] && continue
+    echo "$name"
+  done
+}
+
+# ── Neovim: codediff.nvim, the git diff/merge tool ───────────────
+# `git difftool` / `git mergetool` (lazygit <c-t> / M) can point at
+# codediff.nvim; the git side is opt-in, see recommend_optional(). lazy.nvim would clone it on the first nvim launch and the
+# plugin fetches its prebuilt diff library on first use, so a fresh machine's
+# first difftool run would stall on both downloads. Do them here instead.
+# Prebuilt libraries cover macOS and Linux on x86_64 and arm64; on Linux the
+# plugin also bundles libgomp when nix's nvim cannot see the system copy.
+CODEDIFF_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/nvim/lazy/codediff.nvim"
+
+codediff_installed() {
+  compgen -G "$CODEDIFF_DIR/libvscode_diff*" &>/dev/null
+}
+
+install_codediff() {
+  has nvim || { warn "nvim missing — skipping codediff.nvim"; return; }
+  if codediff_installed; then
+    ok "codediff.nvim"
+    return
+  fi
+  log "Installing codediff.nvim and its diff library..."
+  # A first launch also installs every other missing plugin; that is fine.
+  nvim --headless "+Lazy! install codediff.nvim" "+CodeDiff install" +qa &>/dev/null || true
+  if codediff_installed; then
+    ok "codediff.nvim installed"
+  else
+    warn "codediff.nvim install failed — in nvim run :Lazy install, then :CodeDiff install"
+  fi
+}
+
+check_codediff() {
+  if codediff_installed; then
+    ok "codediff.nvim (diff library present)"
+  else
+    err "codediff.nvim not installed (rerun setup, or in nvim: :Lazy install, :CodeDiff install)"
+  fi
+  # Optional: git config belongs to the machine, not this repo.
+  local tool
+  for tool in diff merge; do
+    if [[ "$(git config --global --get "$tool.tool" 2>/dev/null)" == "codediff" ]]; then
+      ok "git ${tool}tool = codediff"
+    else
+      warn "git ${tool}tool is not codediff (optional; ./setup prints the opt-in commands)"
+    fi
+  done
+}
+
+# ── Post-link hooks ──────────────────────────────────────────────
+post_link() {
+  # opencode plugin install (only if bun is present and opencode is linked)
+  local opencode_dir
+  opencode_dir="$(get_dest opencode)"
+  if [[ -L "$opencode_dir/package.json" ]] && has bun; then
+    log "Installing opencode plugins..."
+    (cd "$opencode_dir" && bun install --silent 2>/dev/null) \
+      && ok "bun install done" \
+      || warn "bun install failed (non-critical)"
+  fi
+
+  # Ensure tmux helper scripts are executable (perms can be lost in some copy/sync flows)
+  # `|| true` so a chmod failure can't abort the run under `set -e`.
+  local tmux_scripts="$DOTFILES/tmux/scripts"
+  if [[ -d "$tmux_scripts" ]]; then
+    chmod +x "$tmux_scripts"/*.sh 2>/dev/null && ok "tmux scripts executable" || true
+  fi
+
+  # Same for the Herdr helper scripts behind the vim-aware pane keybindings.
+  local herdr_scripts="$DOTFILES/herdr/scripts"
+  if [[ -d "$herdr_scripts" ]]; then
+    chmod +x "$herdr_scripts"/*.sh 2>/dev/null && ok "herdr scripts executable" || true
+  fi
+
+  # And the Claude status line + hook scripts. settings.json invokes them
+  # through sh/bash so a lost bit is not fatal, but keep them runnable anyway.
+  local claude_dir="$DOTFILES/claude"
+  if [[ -d "$claude_dir" ]]; then
+    chmod +x "$claude_dir"/statusline.sh "$claude_dir"/hooks/*.sh 2>/dev/null && ok "claude scripts executable" || true
+  fi
+
+  install_herdr_integrations
+  normalize_claude_hook_paths
+  configure_repo_filters
+  install_codediff
+  check_opencode_version
+
+  # Same reason: some sync tools drop the exec bit, so a synced copy can only
+  # be run as `bash setup`. Restore it for next time.
+  if [[ ! -x "$DOTFILES/setup" ]]; then
+    chmod +x "$DOTFILES/setup" 2>/dev/null && ok "setup is executable" || true
+  fi
+}
+
+# ── Check deps (derives from package registries, no hardcoded list) ─
+check_deps() {
+  hdr "Dependencies"
+  ensure_nix_profile_path
+  for entry in "${PACKAGES[@]}"; do
+    IFS='|' read -ra f <<< "$entry"
+    local bin="${f[1]}"
+    if has "$bin"; then ok "$bin"; else err "$bin not found"; fi
+  done
+  if has nix; then ok "nix $(nix --version 2>/dev/null | awk '{print $NF}')"; else err "nix not installed"; fi
+  for entry in "${NIX_PROFILE_PACKAGES[@]}"; do
+    IFS='|' read -ra f <<< "$entry"
+    local name="${f[0]}" bin="${f[1]}" attr="${f[2]}"
+    if has "$bin"; then ok "$name ($bin)"; else err "$name not found (nixpkgs#$attr)"; fi
+  done
+  for entry in "${FONTS[@]}"; do
+    IFS='|' read -ra f <<< "$entry"
+    local name="${f[0]}" cask="${f[1]}" attr="${f[2]}"
+    case "$OS" in
+      macos)
+        if brew list --cask "$cask" &>/dev/null; then ok "$name (brew cask)"; else err "$name not installed (brew install --cask $cask)"; fi
+        ;;
+      linux)
+        # fontconfig is the source of truth: a font present in the nix profile
+        # but absent from fc-list is invisible to every app that asks for it.
+        # Capture first — piping into `grep -q` makes fc-list die of SIGPIPE,
+        # which `set -o pipefail` would report as a failed check.
+        local installed_fonts=""
+        if has fc-list; then installed_fonts="$(fc-list 2>/dev/null || true)"; fi
+        if [[ -n "$installed_fonts" ]] && grep -qiF "$name" <<< "$installed_fonts"; then
+          ok "$name (fontconfig)"
+        elif nix_profile_has_attr "$attr"; then
+          err "$name in nix profile but not visible to fontconfig — rerun setup, or: fc-cache -f"
+        else
+          err "$name not in nix profile (nixpkgs#$attr)"
+        fi
+        ;;
+    esac
+  done
+  for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile"; do
+    if [[ -f "$rc" ]] && grep -Fq "$NIX_PROFILE_PATH_BLOCK_MARK" "$rc"; then
+      ok "nix profile PATH wired into $(basename "$rc")"
+    else
+      err "nix profile PATH not wired into $(basename "$rc")"
+    fi
+  done
+  for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile"; do
+    if [[ -f "$rc" ]] && grep -Fq "$LOCAL_BIN_PATH_BLOCK_MARK" "$rc"; then
+      ok "~/.local/bin PATH wired into $(basename "$rc")"
+    else
+      err "~/.local/bin PATH not wired into $(basename "$rc")"
+    fi
+  done
+  if [[ "$OS" == "linux" ]]; then
+    if has xclip || has xsel || has wl-copy; then
+      ok "clipboard (xclip/xsel/wl-copy)"
+    else
+      warn "clipboard (xclip/xsel/wl-copy not found — OSC52 via tmux/ghostty should still work)"
+    fi
+    if has playerctl; then ok "playerctl"; else err "playerctl not found"; fi
+  fi
+  if has python3 && python3 -c "import pynvim" &>/dev/null; then
+    ok "pynvim (python module)"
+  else
+    err "pynvim not installed"
+  fi
+  if has atuin; then ok "atuin $(atuin --version 2>/dev/null | awk '{print $2}')"; else err "atuin not installed"; fi
+  for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+    if [[ -f "$rc" ]] && grep -Fq "$ATUIN_BLOCK_MARK" "$rc"; then
+      ok "atuin wired into $(basename "$rc")"
+    else
+      err "atuin not wired into $(basename "$rc")"
+    fi
+  done
+  if has herdr; then
+    ok "herdr $(herdr --version 2>/dev/null | awk '{print $2}') ($(command -v herdr))"
+  else
+    err "herdr not installed (curl -fsSL https://herdr.dev/install.sh | sh)"
+  fi
+  if has direnv; then ok "direnv $(direnv version 2>/dev/null)"; else err "direnv not installed"; fi
+  for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do
+    if [[ -f "$rc" ]] && grep -Fq "$DIRENV_BLOCK_MARK" "$rc"; then
+      ok "direnv wired into $(basename "$rc")"
+    else
+      err "direnv not wired into $(basename "$rc")"
+    fi
+  done
+  check_nvim_version
+  check_codediff
+  check_tmux_version
+  check_agents
+  check_repo_filters
+}
+
+# ── Main ─────────────────────────────────────────────────────────
+main() {
+  local mode="link"
+  local skip_deps=true
+
+  for arg in "$@"; do
+    case "$arg" in
+      --check)     mode="check" ;;
+      --install)   skip_deps=false ;;
+      # Link-only is the default now; the flag stays accepted for old habits.
+      --link-only) skip_deps=true ;;
+      --help|-h)
+        echo "Usage: $(basename "$0") [OPTIONS]"
+        echo ""
+        echo "Options:"
+        echo "  (none)       Create symlinks only; installs nothing, edits no shell rc"
+        echo "  --install    Also install deps, Nix, fonts and agent CLIs, and wire PATH,"
+        echo "               atuin, direnv and herdr into ~/.zshrc ~/.bashrc ~/.profile ~/.zshenv"
+        echo "  --check      Verify everything without making changes"
+        echo "  --help, -h   Show this help"
+        exit 0
+        ;;
+      *) echo "Unknown option: $arg (see --help)" >&2; exit 2 ;;
+    esac
+  done
+
+  echo ""
+  log "OS: $OS ($DISTRO)"
+  log "Dotfiles: $DOTFILES"
+
+  # ── Dependencies & agent CLIs ──
+  if [[ "$mode" == "check" ]]; then
+    check_deps
+  elif [[ "$skip_deps" == false ]]; then
+    install_deps
+    install_agents
+  else
+    log "Link-only run: nothing installed, no shell rc edited (--install for that)"
+  fi
+
+  # ── Symlinks ──
+  hdr "Symlinks"
+
+  # Read into an array rather than word-splitting, so config names
+  # containing spaces survive. (while-read, not mapfile — bash 3.2 on macOS.)
+  local items=()
+  while IFS= read -r line; do items+=("$line"); done < <(discover_items)
+
+  for item in "${items[@]}"; do
+    process_item "$item" "$mode"
+    echo ""
+  done
+
+  if [[ "$mode" == "link" ]]; then
+    post_link
+    recommend_optional
+    log "Done! Run '$0 --check' to verify."
+  fi
+  echo ""
+}
+
+main "$@"

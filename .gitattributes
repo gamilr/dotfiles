@@ -1,0 +1,3 @@
+# Claude Code writes machine-specific keys (autoMode, env, auth helpers) into
+# settings.json. ./setup defines this filter so `git add` drops them.
+claude/settings.json filter=claude-settings
